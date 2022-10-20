@@ -1,0 +1,1 @@
+dofile("/Users/martin/Documents/GitHub/AsepriteLua/asepritelua/bitfrosttester.lua")

@@ -14,6 +14,7 @@ function sendToSpriteStash()
             end
         end
     end
+    print("Something went wrong, tell Martin")
 end
 
 sendToSpriteStash()

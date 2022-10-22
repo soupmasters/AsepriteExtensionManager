@@ -2,7 +2,7 @@ disablePattern = "^-"
 eventPattern = "^*"
 ---- Animation Tag Jumper
 --os.execute("sleep " .. tonumber(0.04))
-app.command.GotoFirstFrameInTag()
+--app.command.GotoFirstFrameInTag()
 local dlg = Dialog { title = "Animation List" }
 function getAnimationTags()
     local s = app.activeSprite

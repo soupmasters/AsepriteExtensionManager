@@ -1,4 +1,4 @@
-local spriteStashLocation = "/Users/martin/Dropbox/[ Big Boy Boxing ]/Artwork/Characters/TestScriptStasherLALALA/" -- "/Users/martin/Dropbox/[ Big Boy Boxing ]/Artwork/Characters/TestScriptStasherLALALA/"
+local spriteStashLocation = "D:/Dropbox/[ Big Boy Boxing ]/Artwork/Characters/_deprecated/Current" -- "/Users/martin/Dropbox/[ Big Boy Boxing ]/Artwork/Characters/TestScriptStasherLALALA/"
 local extension = ".ase" --.ase or .aseprite
 
 function sendToSpriteStash()

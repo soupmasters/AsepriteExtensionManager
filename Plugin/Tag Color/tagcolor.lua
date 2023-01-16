@@ -55,10 +55,9 @@ local function updateTagColors()
             tag.color = Color{ r=106, g=205, b=91, a=255 }
 		-- Custom Zone end ..
         end
+		app.refresh()
     end
 end
 end
 
 updateTagColors()
-app.events:off(updateTagColors)
-app.events:on('sitechange', updateTagColors)

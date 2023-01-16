@@ -1,0 +1,18 @@
+{
+  "name": "Tag Color",
+  "displayName": "Tag Color by Soupmasters",
+  "description": "Automaticlly assigns tag colors depending on prefix, and names.",
+  "version": "1.0",
+  "author": { "name": "Soupmasters",
+              "email": "contact@soupmasters.com",
+              "url": "https://soupmasters.com/" },
+  "contributors": [ ],
+  "publisher": "Soupmasters",
+  "license": "Soupmasters",
+  "categories": [ "Scripts" ],
+  "contributes": {
+    "scripts": [
+      { "path": "./tagcolor.lua" }
+    ]
+  }
+}

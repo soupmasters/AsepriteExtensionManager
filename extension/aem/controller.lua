@@ -1,0 +1,1062 @@
+local Compat = require("aem.compat")
+local Model = require("aem.model")
+local Rpc = require("aem.rpc")
+local Ui = require("aem.ui")
+
+local Controller = {}
+Controller.__index = Controller
+
+local STARTUP_INTERVAL_SECONDS = 24 * 60 * 60
+local SELF_UPDATE_DELAY_SECONDS = 0.5
+local MANAGER_NAME = "aseprite-extension-manager"
+
+local function list_from(result, primary, secondary)
+  if type(result) ~= "table" then
+    return {}
+  end
+  local value = result[primary]
+  if type(value) ~= "table" and secondary then
+    value = result[secondary]
+  end
+  return type(value) == "table" and value or {}
+end
+
+local function valid_artifact(artifact)
+  return type(artifact) == "table"
+    and type(artifact.artifactPath) == "string"
+    and artifact.artifactPath ~= ""
+    and type(artifact.name) == "string"
+    and artifact.name ~= ""
+    and artifact.version ~= nil
+end
+
+local function requested_version(package)
+  if package.version then
+    return package.version
+  end
+  if package.latest and package.latest.version then
+    return package.latest.version
+  end
+  return nil
+end
+
+local function is_manager_package(package)
+  return type(package) == "table"
+    and tostring(package.name or ""):lower() == MANAGER_NAME
+end
+
+local function is_self_update(package)
+  return is_manager_package(package)
+    and type(package.update) == "table"
+    and package.update.kind == "self"
+end
+
+function Controller.new(environment)
+  local self = setmetatable({
+    environment = environment,
+    app = environment.app,
+    plugin = environment.plugin,
+    model = Model.new(6),
+    rpc = environment.rpc,
+    startupTimer = nil,
+    selfUpdateTimer = nil,
+    activeOperation = nil,
+    refreshGeneration = 0,
+    closed = false,
+  }, Controller)
+
+  if environment.ui then
+    self.ui = environment.ui
+  else
+    self.ui = Ui.new(environment, self.model)
+  end
+
+  local preferences = self.plugin.preferences
+  if preferences.startupChecks == nil then
+    preferences.startupChecks = true
+  end
+  return self
+end
+
+function Controller:_now()
+  if self.environment.clock then
+    return self.environment.clock()
+  end
+  return self.environment.os.time()
+end
+
+function Controller:_compatible()
+  return Compat.check(self.app)
+end
+
+function Controller:_compatibility_params()
+  return {
+    asepriteVersion = tostring(self.app.version),
+    apiVersion = tonumber(self.app.apiVersion),
+  }
+end
+
+function Controller:_catalog_packages(packages)
+  for _, package in ipairs(packages) do
+    package.latest = Compat.select_release(package, self.app)
+  end
+  return packages
+end
+
+function Controller:_ensure_rpc()
+  if not self.rpc then
+    local factory = self.environment.rpcFactory
+    self.rpc = factory and factory(self.environment) or Rpc.new(self.environment)
+  end
+  return self.rpc
+end
+
+function Controller:_shutdown_rpc(on_done)
+  local rpc = self.rpc
+  self.rpc = nil
+  if rpc then
+    rpc:shutdown(on_done)
+  elseif on_done then
+    on_done()
+  end
+end
+
+function Controller:_stop_self_update_timer()
+  if self.selfUpdateTimer then
+    pcall(function()
+      self.selfUpdateTimer:stop()
+    end)
+    self.selfUpdateTimer = nil
+  end
+end
+
+function Controller:open()
+  if not self.app.isUIAvailable then
+    return false, "ui_unavailable"
+  end
+
+  local compatible, compatibility_error = self:_compatible()
+  if not compatible then
+    self.ui:show_compatibility(compatibility_error)
+    return false, "incompatible"
+  end
+
+  local preferences = self.plugin.preferences
+  if preferences.onboardingVersion ~= 1 then
+    if not self.ui:show_onboarding() then
+      return false, "onboarding_cancelled"
+    end
+    preferences.onboardingVersion = 1
+  end
+
+  self.closed = false
+  self.ui:open(self)
+  self:refresh(false)
+  return true
+end
+
+function Controller:_startup_check_due()
+  local preferences = self.plugin.preferences
+  if preferences.startupChecks == false or preferences.onboardingVersion ~= 1 then
+    return false
+  end
+  local last_check = tonumber(preferences.lastStartupCheckAt) or 0
+  return self:_now() - last_check >= STARTUP_INTERVAL_SECONDS
+end
+
+function Controller:schedule_startup_check()
+  if not self.app.isUIAvailable then
+    return false
+  end
+  local compatible = self:_compatible()
+  if not compatible or not self:_startup_check_due() then
+    return false
+  end
+
+  if not self.environment.Timer then
+    self:run_startup_check()
+    return true
+  end
+
+  local timer
+  timer = self.environment.Timer {
+    interval = 0.5,
+    ontick = function()
+      timer:stop()
+      self.startupTimer = nil
+      self:run_startup_check()
+    end,
+  }
+  self.startupTimer = timer
+  timer:start()
+  return true
+end
+
+function Controller:run_startup_check()
+  if not self.app.isUIAvailable or not self:_startup_check_due() then
+    return false
+  end
+  local compatible = self:_compatible()
+  if not compatible then
+    return false
+  end
+
+  self.plugin.preferences.lastStartupCheckAt = self:_now()
+  self:_ensure_rpc():request("listUpdates", self:_compatibility_params(), {
+    onSuccess = function(result)
+      local updates = list_from(result, "updates", "packages")
+      if #updates > 0 then
+        local suffix = #updates == 1 and "update is" or "updates are"
+        self.app.tip(tostring(#updates) .. " " .. suffix .. " available.", 8)
+      end
+      if not self.ui.dialog then
+        self:_shutdown_rpc()
+      end
+    end,
+    onError = function()
+      if not self.ui.dialog then
+        self:_shutdown_rpc()
+      end
+    end,
+  })
+  return true
+end
+
+function Controller:refresh(show_errors)
+  if self.activeOperation then
+    return false
+  end
+
+  self.refreshGeneration = self.refreshGeneration + 1
+  local generation = self.refreshGeneration
+  self.model:set_update_errors({})
+  self.model.busy = true
+  self.model.status = "Scanning installed extensions…"
+  self.ui:refresh()
+
+  local rpc = self:_ensure_rpc()
+  rpc:request("scanInstalled", {}, {
+    onSuccess = function(result)
+      if generation ~= self.refreshGeneration then
+        return
+      end
+      self.model:set_installed(list_from(result, "packages", "installed"))
+      self.model.status = "Refreshing catalog…"
+      self.ui:refresh()
+
+      rpc:request("refreshRegistry", {}, {
+        onSuccess = function(registry)
+          if generation ~= self.refreshGeneration then
+            return
+          end
+          self.model:set_catalog(
+            self:_catalog_packages(list_from(registry, "packages")),
+            registry.status,
+            registry.expired,
+            registry.fromCache
+          )
+          self.model.status = "Checking for updates…"
+          self.ui:refresh()
+
+          rpc:request("listUpdates", self:_compatibility_params(), {
+            onSuccess = function(updates)
+              if generation ~= self.refreshGeneration then
+                return
+              end
+              self.model:set_installed(list_from(updates, "packages"))
+              self.model:set_update_errors(list_from(updates, "updateErrors"))
+              self.model.busy = false
+              if registry.expired then
+                self.model.status =
+                  "Catalog expired · direct GitHub and local sync remain available"
+              else
+                self.model.status =
+                  "Ready · " .. tostring(#self.model.installed) .. " installed"
+                if #self.model.updateErrors > 0 then
+                  local suffix = #self.model.updateErrors == 1 and "source" or "sources"
+                  self.model.status = self.model.status
+                    .. " · "
+                    .. tostring(#self.model.updateErrors)
+                    .. " update "
+                    .. suffix
+                    .. " unavailable"
+                end
+              end
+              self.ui:refresh()
+            end,
+            onError = function(error_value)
+              if generation ~= self.refreshGeneration then
+                return
+              end
+              self.model.busy = false
+              if registry.expired then
+                self.model.status =
+                  "Catalog expired · direct GitHub and local sync remain available"
+              else
+                self.model.status = "Ready · update check unavailable"
+              end
+              self.ui:refresh()
+              if show_errors then
+                self.ui:show_error("Update Check Failed", error_value)
+              end
+            end,
+          })
+        end,
+        onError = function(error_value)
+          if generation ~= self.refreshGeneration then
+            return
+          end
+          self.model.busy = false
+          self.model.status = "Catalog unavailable · installed extensions were scanned"
+          self.ui:refresh()
+          if show_errors then
+            self.ui:show_error("Catalog Refresh Failed", error_value)
+          end
+        end,
+      })
+    end,
+    onError = function(error_value)
+      if generation ~= self.refreshGeneration then
+        return
+      end
+      self.model.busy = false
+      self.model.status = "The bundled helper is unavailable"
+      self.ui:refresh()
+      if show_errors then
+        self.ui:show_error("Extension Scan Failed", error_value)
+      end
+    end,
+  })
+  return true
+end
+
+function Controller:_begin_operation(title, message)
+  if self.activeOperation then
+    self.app.tip("Another extension operation is already running.", 2)
+    return nil
+  end
+
+  local operation = {
+    cancelled = false,
+    ticket = nil,
+  }
+  self.activeOperation = operation
+  self.model.busy = true
+  self.model.status = message or "Working…"
+  self.ui:refresh()
+
+  operation.progress = self.ui:show_progress(title, message, function()
+    operation.cancelled = true
+    self:_stop_self_update_timer()
+    local restart_helper = operation.selfUpdatePrepared == true and not self.closed
+    if self.activeOperation == operation then
+      self.activeOperation = nil
+      self.model.busy = false
+      self.model.status = "Operation cancelled"
+      self.ui:refresh()
+    end
+    if restart_helper then
+      self:refresh(false)
+    end
+  end)
+  return operation
+end
+
+function Controller:_set_ticket(operation, ticket)
+  operation.ticket = ticket
+  if operation.progress then
+    operation.progress:attach(ticket)
+  end
+end
+
+function Controller:_update_progress(operation, event)
+  if operation.cancelled or self.activeOperation ~= operation then
+    return
+  end
+  if operation.progress then
+    operation.progress:update(event)
+  end
+  if event and event.message then
+    self.model.status = event.message
+    self.ui:refresh()
+  end
+end
+
+function Controller:_replace_progress(operation, title, message)
+  if operation.progress then
+    operation.progress:close()
+  end
+  operation.progress = self.ui:show_progress(title, message, function()
+    operation.cancelled = true
+    self:_stop_self_update_timer()
+    local restart_helper = operation.selfUpdatePrepared == true and not self.closed
+    if operation.ticket then
+      operation.ticket.cancel()
+    end
+    if self.activeOperation == operation then
+      self.activeOperation = nil
+      self.model.busy = false
+      self.model.status = "Operation cancelled"
+      self.ui:refresh()
+    end
+    if restart_helper then
+      self:refresh(false)
+    end
+  end)
+end
+
+function Controller:_finish_operation(operation, status)
+  if self.activeOperation ~= operation then
+    return
+  end
+  if operation.progress then
+    operation.progress:close()
+  end
+  self.activeOperation = nil
+  self.model.busy = false
+  self.model.status = status or "Ready"
+  self.ui:refresh()
+end
+
+function Controller:_operation_error(operation, title, error_value)
+  if operation.cancelled or self.activeOperation ~= operation then
+    return
+  end
+  self:_finish_operation(operation, "Operation failed")
+  self.ui:show_error(title, error_value)
+end
+
+function Controller:_find_installed(name)
+  local folded_name = tostring(name or ""):lower()
+  for _, package in ipairs(self.model.installed) do
+    if tostring(package.name or ""):lower() == folded_name then
+      return package
+    end
+  end
+  return nil
+end
+
+function Controller:_handle_verification_failure(
+  operation,
+  artifact,
+  restore_context,
+  error_value,
+  verification
+)
+  if operation.cancelled or self.activeOperation ~= operation then
+    return
+  end
+
+  verification = type(verification) == "table" and verification or {}
+  if verification.currentIntact == true then
+    self:_finish_operation(operation, "Installation cancelled or not completed")
+    self:refresh(false)
+    return
+  end
+
+  local previous = self:_find_installed(artifact.name)
+  local can_restore = not restore_context
+    and verification.rollbackAvailable == true
+    and previous ~= nil
+    and previous.managed == true
+  self:_finish_operation(operation, "Installation could not be verified")
+  if can_restore and self.ui:confirm(
+    "Installation Verification Failed",
+    "Aseprite did not finish installing "
+      .. artifact.name
+      .. ". Restore the previous cached package now?",
+    "Restore"
+  ) then
+    self:restore_package(previous)
+    return
+  end
+
+  self.ui:show_error("Installation Verification Failed", error_value)
+end
+
+function Controller:_verify_install(operation, artifact, restore_context)
+  local params = {
+    name = artifact.name,
+    version = tostring(artifact.version),
+    artifactPath = artifact.artifactPath,
+    source = artifact.source or {},
+  }
+  local ticket
+  ticket = self:_ensure_rpc():request("verifyInstall", params, {
+    onSuccess = function(result)
+      if operation.cancelled or self.activeOperation ~= operation then
+        return
+      end
+      if result.verified == true then
+        local action = restore_context and "Restored " or "Installed "
+        self:_finish_operation(
+          operation,
+          action .. artifact.name .. " " .. tostring(artifact.version)
+        )
+        self.app.tip(
+          action .. artifact.name .. " " .. tostring(artifact.version),
+          3
+        )
+        self:refresh(false)
+        return
+      end
+
+      self:_handle_verification_failure(
+        operation,
+        artifact,
+        restore_context,
+        {
+          code = "verification_failed",
+          message = result.message
+            or "The installed extension did not match the prepared package.",
+        },
+        result
+      )
+    end,
+    onError = function(error_value)
+      local details = type(error_value) == "table"
+          and type(error_value.details) == "table"
+          and error_value.details
+        or {}
+      self:_handle_verification_failure(
+        operation,
+        artifact,
+        restore_context,
+        error_value,
+        details
+      )
+    end,
+    onProgress = function(event)
+      self:_update_progress(operation, event)
+    end,
+  })
+  self:_set_ticket(operation, ticket)
+end
+
+function Controller:_install_self_update(operation, artifact, restore_context)
+  operation.selfUpdatePrepared = true
+  self:_update_progress(operation, {
+    message = "Stopping the helper before Aseprite replaces the manager…",
+  })
+
+  local function resume_after_failure()
+    if self.closed then
+      return
+    end
+    self:refresh(false)
+  end
+
+  local function install()
+    if self.closed or operation.cancelled or self.activeOperation ~= operation then
+      return
+    end
+    self:_update_progress(operation, {
+      message = "Waiting for Aseprite's installation confirmation…",
+    })
+
+    local install_result
+    local install_ok, install_error = pcall(function()
+      install_result = self.app.command.Options {
+        installExtension = artifact.artifactPath,
+      }
+    end)
+    if not install_ok then
+      self:_operation_error(operation, "Aseprite Installer Failed", {
+        code = "installer_failed",
+        message = tostring(install_error),
+        details = {
+          recoveryArtifact = artifact.recoveryArtifact,
+        },
+      })
+      resume_after_failure()
+      return
+    end
+    if install_result == false then
+      self:_finish_operation(operation, "Manager installation cancelled")
+      resume_after_failure()
+      return
+    end
+
+    -- Installing this package can unload this controller before Options returns.
+    -- The new helper reconciles and verifies the pending update after restart.
+    if self.closed or self.activeOperation ~= operation then
+      return
+    end
+    local action = restore_context and "restore" or "update"
+    self:_finish_operation(operation, "Restart Aseprite to finish the manager " .. action)
+    self.app.alert {
+      title = "Restart Aseprite",
+      text = "Restart Aseprite before using Extension Manager again. "
+        .. "The new helper will verify the manager on startup.\n\n"
+        .. "Recovery package: "
+        .. tostring(artifact.recoveryArtifact or "saved by the helper"),
+      buttons = "OK",
+    }
+  end
+
+  self:_shutdown_rpc(function()
+    if self.closed or operation.cancelled or self.activeOperation ~= operation then
+      return
+    end
+    if not self.environment.Timer then
+      install()
+      return
+    end
+
+    local timer
+    timer = self.environment.Timer {
+      interval = SELF_UPDATE_DELAY_SECONDS,
+      ontick = function()
+        timer:stop()
+        if self.selfUpdateTimer == timer then
+          self.selfUpdateTimer = nil
+        end
+        install()
+      end,
+    }
+    self.selfUpdateTimer = timer
+    timer:start()
+  end)
+end
+
+function Controller:_install_artifact(operation, artifact, restore_context)
+  if operation.cancelled or self.activeOperation ~= operation then
+    return
+  end
+  if not valid_artifact(artifact) then
+    self:_operation_error(operation, "Package Preparation Failed", {
+      code = "invalid_artifact",
+      message = "The helper did not return a complete prepared package.",
+    })
+    return
+  end
+  if not self.app.fs.isFile(artifact.artifactPath) then
+    self:_operation_error(operation, "Package Preparation Failed", {
+      code = "artifact_missing",
+      message = "The prepared extension file is missing.",
+    })
+    return
+  end
+
+  if artifact.selfUpdate == true then
+    if not is_manager_package(artifact)
+      or artifact.restartRequired ~= true
+      or type(artifact.recoveryArtifact) ~= "string"
+      or artifact.recoveryArtifact == ""
+      or not self.app.fs.isFile(artifact.recoveryArtifact)
+    then
+      self:_operation_error(operation, "Manager Update Preparation Failed", {
+        code = "invalid_self_update_artifact",
+        message = "The helper did not return a complete manager update and recovery package.",
+      })
+      return
+    end
+    self:_install_self_update(operation, artifact, restore_context)
+    return
+  end
+
+  self:_update_progress(operation, {
+    message = "Waiting for Aseprite's installation confirmation…",
+  })
+  local install_result
+  local install_ok, install_error = pcall(function()
+    install_result = self.app.command.Options {
+      installExtension = artifact.artifactPath,
+    }
+  end)
+  if not install_ok then
+    self:_operation_error(operation, "Aseprite Installer Failed", {
+      code = "installer_failed",
+      message = tostring(install_error),
+    })
+    return
+  end
+  if install_result == false then
+    self:_finish_operation(operation, "Installation cancelled or not completed")
+    self:refresh(false)
+    return
+  end
+  if operation.cancelled then
+    return
+  end
+
+  self:_update_progress(operation, {
+    message = "Verifying the installed extension…",
+  })
+  self:_verify_install(operation, artifact, restore_context)
+end
+
+function Controller:_resolved_github(operation, url, result)
+  if operation.cancelled or self.activeOperation ~= operation then
+    return
+  end
+
+  local choices = result.choices or result.assets
+  if type(choices) == "table" and #choices > 0 then
+    if operation.progress then
+      operation.progress:close()
+      operation.progress = nil
+    end
+    local selection = self.ui:choose_github_asset(choices)
+    if not selection then
+      operation.cancelled = true
+      self.activeOperation = nil
+      self.model.busy = false
+      self.model.status = "Installation cancelled"
+      self.ui:refresh()
+      return
+    end
+    self:_replace_progress(operation, "Install from GitHub", "Resolving the selected release asset…")
+    self:_resolve_github(operation, url, selection)
+    return
+  end
+
+  if valid_artifact(result) then
+    self:_install_artifact(operation, result, false)
+    return
+  end
+
+  local ticket
+  ticket = self:_ensure_rpc():request("preparePackage", {
+    resolution = result,
+  }, {
+    onSuccess = function(artifact)
+      self:_install_artifact(operation, artifact, false)
+    end,
+    onError = function(error_value)
+      self:_operation_error(operation, "GitHub Package Preparation Failed", error_value)
+    end,
+    onProgress = function(event)
+      self:_update_progress(operation, event)
+    end,
+  })
+  self:_set_ticket(operation, ticket)
+end
+
+function Controller:_resolve_github(operation, url, selection)
+  local params = {
+    url = url,
+  }
+  if selection ~= nil then
+    params.selection = selection
+  end
+  local ticket
+  ticket = self:_ensure_rpc():request("resolveGitHub", params, {
+    onSuccess = function(result)
+      self:_resolved_github(operation, url, result)
+    end,
+    onError = function(error_value)
+      self:_operation_error(operation, "GitHub Resolution Failed", error_value)
+    end,
+    onProgress = function(event)
+      self:_update_progress(operation, event)
+    end,
+  })
+  self:_set_ticket(operation, ticket)
+end
+
+function Controller:install_from_github()
+  if self.activeOperation then
+    return false
+  end
+  local url = self.ui:prompt_github_url()
+  if not url then
+    return false
+  end
+  url = tostring(url):match("^%s*(.-)%s*$")
+  if url == "" then
+    self.ui:show_error("GitHub URL Required", {
+      code = "missing_url",
+      message = "Enter a public GitHub repository or release asset URL.",
+    })
+    return false
+  end
+
+  local operation = self:_begin_operation("Install from GitHub", "Resolving the GitHub source…")
+  if not operation then
+    return false
+  end
+  self:_resolve_github(operation, url)
+  return true
+end
+
+function Controller:sync_local_folder()
+  if self.activeOperation then
+    return false
+  end
+  local package_json = self.ui:prompt_package_json()
+  if not package_json then
+    return false
+  end
+  if self.app.fs.fileName(package_json):lower() ~= "package.json"
+    or not self.app.fs.isFile(package_json)
+  then
+    self.ui:show_error("Invalid Local Folder", {
+      code = "package_json_required",
+      message = "Select the local extension folder's package.json file.",
+    })
+    return false
+  end
+
+  local operation = self:_begin_operation(
+    "Link Local Folder",
+    "Creating a safe snapshot and remembering the linked folder…"
+  )
+  if not operation then
+    return false
+  end
+  local ticket
+  ticket = self:_ensure_rpc():request("syncLocal", {
+    packageJsonPath = package_json,
+  }, {
+    onSuccess = function(artifact)
+      self:_install_artifact(operation, artifact, false)
+    end,
+    onError = function(error_value)
+      self:_operation_error(operation, "Local Link Failed", error_value)
+    end,
+    onProgress = function(event)
+      self:_update_progress(operation, event)
+    end,
+  })
+  self:_set_ticket(operation, ticket)
+  return true
+end
+
+function Controller:install_registry_package(package)
+  if self.model.registryExpired or package.yanked or self.activeOperation then
+    return false
+  end
+  local operation = self:_begin_operation("Install Extension", "Preparing the catalog package…")
+  if not operation then
+    return false
+  end
+  local ticket
+  local version = requested_version(package)
+  if not version then
+    self.ui:show_error("Package Unavailable", {
+      code = "no_compatible_release",
+      message = "This package has no compatible stable release for this Aseprite version.",
+    })
+    return false
+  end
+  local params = self:_compatibility_params()
+  params.packageId = package.id or package.name
+  params.version = version
+  ticket = self:_ensure_rpc():request("preparePackage", params, {
+    onSuccess = function(artifact)
+      self:_install_artifact(operation, artifact, false)
+    end,
+    onError = function(error_value)
+      self:_operation_error(operation, "Package Preparation Failed", error_value)
+    end,
+    onProgress = function(event)
+      self:_update_progress(operation, event)
+    end,
+  })
+  self:_set_ticket(operation, ticket)
+  return true
+end
+
+function Controller:update_package(package)
+  local self_update = is_self_update(package)
+  if self.activeOperation or (not package.managed and not self_update) then
+    return false
+  end
+  if self_update and not self.ui:confirm(
+    "Update Extension Manager",
+    "The helper will download the official stable release and save a recovery package. "
+      .. "It must stop before Aseprite replaces the manager, and you must restart Aseprite afterward. "
+      .. "If startup verification fails, the manager will show the recovery package path.",
+    "Prepare Update"
+  ) then
+    return false
+  end
+
+  local operation = self:_begin_operation(
+    self_update and "Update Extension Manager" or "Update Extension",
+    self_update and "Preparing a verified manager update…" or "Preparing the update…"
+  )
+  if not operation then
+    return false
+  end
+  local update = type(package.update) == "table" and package.update or {}
+  local method = self_update and "prepareSelfUpdate" or "preparePackage"
+  local params = {}
+  if not self_update then
+    params = self:_compatibility_params()
+    params.packageId = package.name
+    params.version = update.version
+    params.source = update.source or package.source
+  end
+  local ticket
+  ticket = self:_ensure_rpc():request(method, params, {
+    onSuccess = function(artifact)
+      if self_update and (type(artifact) ~= "table" or artifact.selfUpdate ~= true) then
+        self:_operation_error(operation, "Manager Update Preparation Failed", {
+          code = "invalid_self_update_artifact",
+          message = "The helper did not prepare a dedicated manager update transaction.",
+        })
+        return
+      end
+      if not self_update then
+        artifact.rollbackAvailable = true
+      end
+      self:_install_artifact(operation, artifact, false)
+    end,
+    onError = function(error_value)
+      self:_operation_error(operation, "Update Preparation Failed", error_value)
+    end,
+    onProgress = function(event)
+      self:_update_progress(operation, event)
+    end,
+  })
+  self:_set_ticket(operation, ticket)
+  return true
+end
+
+function Controller:restore_package(package)
+  if self.activeOperation or not package then
+    return false
+  end
+  local self_rollback = is_manager_package(package)
+  if self_rollback and not self.ui:confirm(
+    "Restore Extension Manager",
+    "The helper will save the current manager as a recovery package, then stop before Aseprite "
+      .. "restores the previous verified version. You must restart Aseprite afterward. "
+      .. "If startup verification fails, the manager will show the recovery package path.",
+    "Prepare Restore"
+  ) then
+    return false
+  end
+
+  local operation = self:_begin_operation(
+    self_rollback and "Restore Extension Manager" or "Restore Extension",
+    self_rollback and "Preparing the previous verified manager…"
+      or "Preparing the previous cached package…"
+  )
+  if not operation then
+    return false
+  end
+  local ticket
+  local method = self_rollback and "prepareSelfRollback" or "prepareRollback"
+  local params = self_rollback and {} or {
+    name = package.name,
+  }
+  ticket = self:_ensure_rpc():request(method, params, {
+    onSuccess = function(artifact)
+      if self_rollback and (type(artifact) ~= "table" or artifact.selfUpdate ~= true) then
+        self:_operation_error(operation, "Manager Restore Preparation Failed", {
+          code = "invalid_self_update_artifact",
+          message = "The helper did not prepare a dedicated manager restore transaction.",
+        })
+        return
+      end
+      self:_install_artifact(operation, artifact, true)
+    end,
+    onError = function(error_value)
+      self:_operation_error(operation, "Restore Preparation Failed", error_value)
+    end,
+    onProgress = function(event)
+      self:_update_progress(operation, event)
+    end,
+  })
+  self:_set_ticket(operation, ticket)
+  return true
+end
+
+function Controller:clear_cache()
+  if self.activeOperation then
+    return false
+  end
+  local operation = self:_begin_operation("Clear Cache", "Removing unused cached artifacts…")
+  if not operation then
+    return false
+  end
+  local ticket
+  ticket = self:_ensure_rpc():request("clearCache", {
+    preserveRestorePoints = true,
+  }, {
+    onSuccess = function()
+      self:_finish_operation(operation, "Download cache cleared")
+    end,
+    onError = function(error_value)
+      self:_operation_error(operation, "Cache Cleanup Failed", error_value)
+    end,
+    onProgress = function(event)
+      self:_update_progress(operation, event)
+    end,
+  })
+  self:_set_ticket(operation, ticket)
+  return true
+end
+
+function Controller:open_native_extension_preferences(action, package)
+  local package_name = package and (package.displayName or package.name)
+    or "the extension"
+  local instruction
+  if action == "enable_disable" then
+    instruction = "Choose Extensions in Aseprite Preferences, select "
+      .. tostring(package_name)
+      .. ", then enable or disable it."
+  elseif action == "uninstall" then
+    instruction = "Choose Extensions in Aseprite Preferences, select "
+      .. tostring(package_name)
+      .. ", then use Uninstall."
+  else
+    instruction =
+      "Choose Extensions in Aseprite Preferences to enable, disable, or uninstall."
+  end
+  self.app.alert {
+    title = "Manage Aseprite Extension",
+    text = instruction,
+    buttons = "Continue",
+  }
+
+  local opened, open_error = pcall(function()
+    self.app.command.Options()
+  end)
+  if not opened then
+    self.ui:show_error("Aseprite Preferences Failed", {
+      code = "preferences_failed",
+      message = tostring(open_error),
+    })
+    return false
+  end
+  self:refresh(false)
+  return true
+end
+
+function Controller:on_dialog_closed()
+  self:_stop_self_update_timer()
+  self.refreshGeneration = self.refreshGeneration + 1
+  if self.activeOperation then
+    self.activeOperation.cancelled = true
+    if self.activeOperation.ticket then
+      self.activeOperation.ticket.cancel()
+    end
+    self.activeOperation = nil
+  end
+  self.model.busy = false
+  self:_shutdown_rpc()
+end
+
+function Controller:close()
+  self.closed = true
+  self:_stop_self_update_timer()
+  if self.startupTimer then
+    pcall(function()
+      self.startupTimer:stop()
+    end)
+    self.startupTimer = nil
+  end
+  self.refreshGeneration = self.refreshGeneration + 1
+  if self.activeOperation and self.activeOperation.ticket then
+    self.activeOperation.ticket.cancel()
+  end
+  self.activeOperation = nil
+  self.ui:close()
+  self:_shutdown_rpc()
+end
+
+return Controller

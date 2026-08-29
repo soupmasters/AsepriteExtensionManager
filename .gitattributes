@@ -1,0 +1,9 @@
+* text=auto eol=lf
+*.lua text eol=lf
+*.rs text eol=lf
+*.json text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.md text eol=lf
+*.exe binary
+*.aseprite-extension binary

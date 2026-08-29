@@ -1,0 +1,37 @@
+{
+  "name": "aseprite-extension-manager",
+  "displayName": "Aseprite Extension Manager",
+  "description": "An unofficial package manager for installing, updating, and developing Aseprite extensions.",
+  "version": "0.1.0",
+  "author": {
+    "name": "Martin Calander",
+    "url": "https://github.com/martincalander"
+  },
+  "publisher": "martincalander",
+  "license": "MIT",
+  "homepage": "https://github.com/soupmasters/AsepriteExtensionManager",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/soupmasters/AsepriteExtensionManager.git"
+  },
+  "categories": [
+    "Scripts"
+  ],
+  "keywords": [
+    "extensions",
+    "packages",
+    "updates",
+    "development"
+  ],
+  "engines": {
+    "aseprite": ">=1.3.15",
+    "asepriteApi": ">=35"
+  },
+  "contributes": {
+    "scripts": [
+      {
+        "path": "./main.lua"
+      }
+    ]
+  }
+}

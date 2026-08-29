@@ -1,0 +1,1 @@
+This directory must not appear in a synchronized package.

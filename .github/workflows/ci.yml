@@ -1,0 +1,130 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust-quality:
+    name: Rust quality
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: Check formatting
+        run: cargo fmt --all --check
+      - name: Run Clippy
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+
+  rust-tests:
+    name: Rust tests (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - macos-14
+          - ubuntu-latest
+          - windows-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run workspace tests
+        run: cargo test --workspace --all-features --locked
+
+  rust-msrv:
+    name: Rust 1.88 compatibility
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.88.0
+      - uses: Swatinem/rust-cache@v2
+      - name: Check declared minimum Rust version
+        run: cargo check --workspace --all-features --locked
+
+  lua-tests:
+    name: Lua tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Lua
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes lua5.4
+      - name: Run fake-Aseprite tests
+        run: lua5.4 tests/lua/run.lua
+
+  registry:
+    name: Registry integrity
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Validate catalog schema
+        shell: bash
+        run: |
+          cargo run --locked -p xtask -- validate-catalog \
+            --schema registry/schema/catalog-v1.schema.json \
+            --catalog registry/bundled/targets/catalog-v1.json
+          cargo run --locked -p xtask -- validate-catalog \
+            --schema registry/schema/catalog-v1.schema.json \
+            --catalog registry/fixtures/catalog-v1-valid.json
+          if cargo run --locked -p xtask -- validate-catalog \
+            --schema registry/schema/catalog-v1.schema.json \
+            --catalog registry/fixtures/catalog-v1-invalid.json; then
+            echo "Invalid catalog fixture was accepted."
+            exit 1
+          fi
+      - name: Verify authenticated catalog
+        run: >-
+          cargo run --locked -p xtask --
+          verify-registry-fixtures
+          --root registry/bundled/root.json
+          --metadata registry/bundled/metadata
+          --targets registry/bundled/targets
+      - name: Verify reproducible fixture metadata
+        shell: bash
+        run: |
+          fixture_output="$(mktemp -d)"
+          cargo run --locked -p xtask -- registry-fixtures \
+            --keys registry/fixtures/keys \
+            --catalog registry/bundled/targets/catalog-v1.json \
+            --output "$fixture_output"
+          diff --recursive --unified registry/bundled "$fixture_output"
+
+  dependency-policy:
+    name: Dependency policy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+          arguments: --all-features --config .github/deny.toml
+
+  advisories:
+    name: Security advisories
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      checks: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: rustsec/audit-check@v2.0.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}

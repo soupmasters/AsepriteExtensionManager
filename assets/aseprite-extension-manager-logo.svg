@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" fill="none" role="img" aria-labelledby="title description">
+  <title id="title">Aseprite Extension Manager logo</title>
+  <desc id="description">A smooth Aseprite-inspired rounded-square face peeking from a compact plum package box.</desc>
+
+  <defs>
+    <clipPath id="face-clip">
+      <rect x="134" y="70" width="244" height="210" rx="66"/>
+    </clipPath>
+  </defs>
+
+  <!-- The rear rim stays behind the mascot so the cube reads as open. -->
+  <path d="M48 220 256 166 464 220" stroke="#655561" stroke-width="16" stroke-linecap="round" stroke-linejoin="round"/>
+
+  <!-- A smooth, squat interpretation of the Aseprite app face. -->
+  <g clip-path="url(#face-clip)">
+    <rect x="134" y="70" width="244" height="210" fill="#7D929E"/>
+    <path fill="#FFFFFF" d="M200 78h112c32 0 58 26 58 58v42c0 32-26 54-58 54H200c-32 0-58-22-58-54v-42c0-32 26-58 58-58Z"/>
+  </g>
+  <rect x="134" y="70" width="244" height="210" rx="66" stroke="#655561" stroke-width="16"/>
+
+  <!-- Evenly placed eyes keep the gaze neutral and straight ahead. -->
+  <rect x="208" y="124" width="18" height="54" rx="9" fill="#655561"/>
+  <rect x="286" y="124" width="18" height="54" rx="9" fill="#655561"/>
+
+  <!-- Compact package faces hide the mascot's lower portion cleanly. -->
+  <path fill="#FFFFFF" stroke="#655561" stroke-width="16" stroke-linecap="round" stroke-linejoin="round" d="M48 220 256 270v204L48 420V220Z"/>
+  <path fill="#FFFFFF" stroke="#655561" stroke-width="16" stroke-linecap="round" stroke-linejoin="round" d="M256 270 464 220v200l-208 54V270Z"/>
+</svg>

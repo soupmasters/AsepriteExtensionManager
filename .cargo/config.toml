@@ -1,0 +1,2 @@
+[alias]
+deploy-local = "run --locked -p xtask -- deploy-local"

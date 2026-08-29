@@ -1,0 +1,213 @@
+name: Alpha package
+
+on:
+  push:
+    branches:
+      - main
+      - master
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  package-metadata:
+    name: Validate package metadata
+    runs-on: ubuntu-latest
+    outputs:
+      package_version: ${{ steps.package.outputs.package_version }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Read and validate package version
+        id: package
+        shell: bash
+        run: |
+          package_version="$(jq --raw-output '.version' extension/package.json)"
+          if [[ ! "$package_version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "extension/package.json must contain a stable semantic version."
+            exit 1
+          fi
+          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+            if [[ ! "$GITHUB_REF_NAME" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+              echo "Release tags must use vMAJOR.MINOR.PATCH."
+              exit 1
+            fi
+            if [[ "${GITHUB_REF_NAME#v}" != "$package_version" ]]; then
+              echo "Tag $GITHUB_REF_NAME does not match package version $package_version."
+              exit 1
+            fi
+          fi
+          helper_version="$(cargo metadata --locked --no-deps --format-version 1 \
+            | jq --raw-output '.packages[] | select(.name == "aem-helper") | .version')"
+          if [[ "$helper_version" != "$package_version" ]]; then
+            echo "Helper version $helper_version does not match extension version $package_version."
+            exit 1
+          fi
+          echo "package_version=$package_version" >> "$GITHUB_OUTPUT"
+
+  macos-helper:
+    name: macOS universal helper
+    needs: package-metadata
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+      - name: Build both architectures
+        run: |
+          cargo build --locked --release -p aem-helper --target aarch64-apple-darwin
+          cargo build --locked --release -p aem-helper --target x86_64-apple-darwin
+      - name: Assemble and smoke-test universal helper
+        env:
+          PACKAGE_VERSION: ${{ needs.package-metadata.outputs.package_version }}
+        run: |
+          mkdir -p artifacts/macos
+          lipo -create \
+            target/aarch64-apple-darwin/release/aem-helper \
+            target/x86_64-apple-darwin/release/aem-helper \
+            -output artifacts/macos/aem-helper
+          chmod 0755 artifacts/macos/aem-helper
+          lipo artifacts/macos/aem-helper -verify_arch arm64 x86_64
+          test "$(artifacts/macos/aem-helper --version)" = "aem-helper $PACKAGE_VERSION"
+          artifacts/macos/aem-helper smoke
+      - uses: actions/upload-artifact@v7
+        with:
+          name: helper-macos
+          path: artifacts/macos/aem-helper
+          if-no-files-found: error
+
+  windows-helper:
+    name: Windows x86_64 helper
+    needs: package-metadata
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build helper
+        run: cargo build --locked --release -p aem-helper
+      - name: Smoke-test helper
+        shell: pwsh
+        env:
+          PACKAGE_VERSION: ${{ needs.package-metadata.outputs.package_version }}
+        run: |
+          New-Item -ItemType Directory -Force artifacts/windows
+          Copy-Item target/release/aem-helper.exe artifacts/windows/aem-helper.exe
+          $reportedVersion = (& artifacts/windows/aem-helper.exe --version).Trim()
+          if ($reportedVersion -ne "aem-helper $env:PACKAGE_VERSION") {
+            throw "Helper reported $reportedVersion; expected aem-helper $env:PACKAGE_VERSION"
+          }
+          & artifacts/windows/aem-helper.exe smoke
+      - uses: actions/upload-artifact@v7
+        with:
+          name: helper-windows
+          path: artifacts/windows/aem-helper.exe
+          if-no-files-found: error
+
+  linux-helper:
+    name: Linux x86_64 static helper
+    needs: package-metadata
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+      - name: Install musl toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes musl-tools
+      - name: Build helper
+        run: >-
+          cargo build --locked --release -p aem-helper
+          --target x86_64-unknown-linux-musl
+      - name: Verify portability and smoke-test
+        env:
+          PACKAGE_VERSION: ${{ needs.package-metadata.outputs.package_version }}
+        run: |
+          mkdir -p artifacts/linux
+          cp target/x86_64-unknown-linux-musl/release/aem-helper artifacts/linux/aem-helper
+          chmod 0755 artifacts/linux/aem-helper
+          file artifacts/linux/aem-helper | grep -E 'static|statically linked'
+          test "$(artifacts/linux/aem-helper --version)" = "aem-helper $PACKAGE_VERSION"
+          artifacts/linux/aem-helper smoke
+      - uses: actions/upload-artifact@v7
+        with:
+          name: helper-linux
+          path: artifacts/linux/aem-helper
+          if-no-files-found: error
+
+  assemble:
+    name: Assemble universal extension
+    needs:
+      - package-metadata
+      - macos-helper
+      - windows-helper
+      - linux-helper
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/download-artifact@v8
+        with:
+          name: helper-macos
+          path: .build/helpers/macos
+      - uses: actions/download-artifact@v8
+        with:
+          name: helper-windows
+          path: .build/helpers/windows
+      - uses: actions/download-artifact@v8
+        with:
+          name: helper-linux
+          path: .build/helpers/linux
+      - name: Stage package
+        run: |
+          chmod 0755 .build/helpers/macos/aem-helper
+          chmod 0755 .build/helpers/linux/aem-helper
+          cargo run --locked -p xtask -- stage \
+            --extension extension \
+            --registry registry/bundled \
+            --macos-helper .build/helpers/macos/aem-helper \
+            --windows-helper .build/helpers/windows/aem-helper.exe \
+            --linux-helper .build/helpers/linux/aem-helper \
+            --output .build/package-input
+      - name: Build and compare deterministic archives
+        env:
+          PACKAGE_VERSION: ${{ needs.package-metadata.outputs.package_version }}
+        run: |
+          cargo run --locked -p xtask -- package \
+            --input .build/package-input \
+            --output .build/first
+          cargo run --locked -p xtask -- package \
+            --input .build/package-input \
+            --output dist
+          cmp \
+            ".build/first/aseprite-extension-manager-$PACKAGE_VERSION.aseprite-extension" \
+            "dist/aseprite-extension-manager-$PACKAGE_VERSION.aseprite-extension"
+          cargo run --locked -p xtask -- validate-extension \
+            "dist/aseprite-extension-manager-$PACKAGE_VERSION.aseprite-extension"
+      - name: Confirm private fixtures are absent
+        env:
+          PACKAGE_VERSION: ${{ needs.package-metadata.outputs.package_version }}
+        run: |
+          if unzip -Z1 "dist/aseprite-extension-manager-$PACKAGE_VERSION.aseprite-extension" \
+            | grep -E '^registry/(fixtures|keys)/|seed|private'; then
+            echo "Private registry material was included in the package."
+            exit 1
+          fi
+      - uses: actions/upload-artifact@v7
+        with:
+          name: aseprite-extension-manager-${{ needs.package-metadata.outputs.package_version }}
+          path: dist/aseprite-extension-manager-${{ needs.package-metadata.outputs.package_version }}.aseprite-extension
+          if-no-files-found: error
+          retention-days: 14

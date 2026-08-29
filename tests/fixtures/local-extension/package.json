@@ -1,0 +1,21 @@
+{
+  "name": "aem-acceptance-fixture",
+  "displayName": "Extension Manager Acceptance Fixture",
+  "description": "A small extension used to verify package installation and local synchronization.",
+  "version": "1.0.0",
+  "author": {
+    "name": "Martin Calander"
+  },
+  "publisher": "martincalander",
+  "license": "MIT",
+  "categories": [
+    "Scripts"
+  ],
+  "contributes": {
+    "scripts": [
+      {
+        "path": "./fixture.lua"
+      }
+    ]
+  }
+}

@@ -1,8 +1,26 @@
+# Rust and generated packages
 /target/
 /dist/
 /.build/
-/.idea/
-/.vscode/
-.DS_Store
 *.aseprite-extension
+
+# Editors
+.idea/
+.vscode/
+.fleet/
+*.iml
+*.swp
+*.swo
+*~
+
+# Operating-system metadata
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+Thumbs.db
+Desktop.ini
+
+# Local logs and temporary files
 *.log
+*.tmp

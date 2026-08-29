@@ -8,6 +8,8 @@ use crate::package::Manifest;
 use crate::protocol::{RpcError, RpcResult};
 use crate::state::{Receipt, State};
 
+const MANAGER_NAME: &str = "aseprite-extension-manager";
+
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct InstalledPackage {
@@ -16,6 +18,7 @@ pub struct InstalledPackage {
     pub display_name: Option<String>,
     pub version: String,
     pub path: PathBuf,
+    pub is_self: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub enabled: Option<bool>,
     pub managed: bool,
@@ -29,10 +32,27 @@ pub struct InstalledPackage {
 }
 
 pub fn scan(user_config_path: &Path, state: &State) -> RpcResult<Vec<InstalledPackage>> {
+    scan_inner(user_config_path, state, None)
+}
+
+pub fn scan_with_manager_root(
+    user_config_path: &Path,
+    state: &State,
+    manager_root: &Path,
+) -> RpcResult<Vec<InstalledPackage>> {
+    scan_inner(user_config_path, state, Some(manager_root))
+}
+
+fn scan_inner(
+    user_config_path: &Path,
+    state: &State,
+    manager_root: Option<&Path>,
+) -> RpcResult<Vec<InstalledPackage>> {
     let extensions = user_config_path.join("extensions");
     if !extensions.exists() {
         return Ok(Vec::new());
     }
+    let canonical_manager_root = manager_root.and_then(|root| fs::canonicalize(root).ok());
     let receipts = state.receipts()?;
     let mut packages = Vec::new();
     for entry in fs::read_dir(&extensions).map_err(RpcError::io)? {
@@ -49,6 +69,14 @@ pub fn scan(user_config_path: &Path, state: &State) -> RpcResult<Vec<InstalledPa
             Ok(manifest) => manifest,
             Err(_) => continue,
         };
+        let canonical_package_path = canonical_manager_root
+            .as_ref()
+            .and_then(|_| fs::canonicalize(entry.path()).ok());
+        let is_self = manifest.name.eq_ignore_ascii_case(MANAGER_NAME)
+            && canonical_manager_root
+                .as_ref()
+                .zip(canonical_package_path.as_ref())
+                .is_some_and(|(manager, package)| manager == package);
         let receipt = receipts.iter().find(|receipt| {
             receipt.package_name.eq_ignore_ascii_case(&manifest.name)
                 && receipt.installed_version == manifest.version
@@ -60,6 +88,7 @@ pub fn scan(user_config_path: &Path, state: &State) -> RpcResult<Vec<InstalledPa
             display_name: manifest.display_name,
             version: manifest.version,
             path: entry.path(),
+            is_self,
             enabled: None,
             managed: receipt.is_some(),
             source: receipt.map(|receipt| receipt.source.clone()),
@@ -125,6 +154,9 @@ pub fn attach_updates(
 ) {
     for package in packages {
         if let Some(release) = releases.get(&package.name.to_lowercase()) {
+            if release.get("kind").and_then(Value::as_str) == Some("self") && !package.is_self {
+                continue;
+            }
             package.update = Some(release.clone());
         }
     }
@@ -135,6 +167,9 @@ pub fn attach_update_errors(
     errors: &std::collections::BTreeMap<String, Value>,
 ) {
     for package in packages {
+        if package.name.eq_ignore_ascii_case(MANAGER_NAME) && !package.is_self {
+            continue;
+        }
         if let Some(error) = errors.get(&package.name.to_lowercase()) {
             package.update_error = Some(error.clone());
         }
@@ -281,5 +316,59 @@ mod tests {
                 .expect("unmanaged package")
                 .managed
         );
+    }
+
+    #[test]
+    fn only_the_canonical_running_manager_is_marked_as_self() {
+        let temporary = tempfile::tempdir().expect("tempdir");
+        let extensions = temporary.path().join("extensions");
+        let manager = extensions.join("Current Manager");
+        let duplicate = extensions.join("Old Manager Copy");
+        for directory in [&manager, &duplicate] {
+            fs::create_dir_all(directory).expect("mkdir");
+            fs::write(
+                directory.join("package.json"),
+                br#"{"name":"aseprite-extension-manager","version":"0.1.0"}"#,
+            )
+            .expect("manifest");
+        }
+        let state = State::new(temporary.path()).expect("state");
+
+        let mut packages =
+            scan_with_manager_root(temporary.path(), &state, &manager).expect("manager-aware scan");
+
+        assert_eq!(packages.len(), 2);
+        let current = packages
+            .iter()
+            .find(|package| package.path == manager)
+            .expect("running manager");
+        let old = packages
+            .iter()
+            .find(|package| package.path == duplicate)
+            .expect("duplicate manager");
+        assert!(current.is_self);
+        assert!(!old.is_self);
+
+        let updates = std::collections::BTreeMap::from([(
+            MANAGER_NAME.to_owned(),
+            serde_json::json!({"kind":"self","version":"0.2.0"}),
+        )]);
+        attach_updates(&mut packages, &updates);
+        let current = packages
+            .iter()
+            .find(|package| package.is_self)
+            .expect("running manager after update attachment");
+        let old = packages
+            .iter()
+            .find(|package| package.path == duplicate)
+            .expect("duplicate manager after update attachment");
+        assert_eq!(
+            current
+                .update
+                .as_ref()
+                .and_then(|update| update.get("kind")),
+            Some(&Value::String("self".to_owned()))
+        );
+        assert!(old.update.is_none());
     }
 }

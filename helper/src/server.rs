@@ -303,7 +303,11 @@ async fn handle_request(context: Arc<Context>, method: Method, params: Value) ->
         }
         Method::ScanInstalled => {
             let _: EmptyParams = decode_params(params)?;
-            let packages = installed::scan(&context.user_config, &context.state)?;
+            let packages = installed::scan_with_manager_root(
+                &context.user_config,
+                &context.state,
+                &context.extension_root,
+            )?;
             Ok(serde_json::json!({ "packages": packages }))
         }
         Method::RefreshRegistry => {
@@ -626,7 +630,11 @@ async fn handle_request(context: Arc<Context>, method: Method, params: Value) ->
                 *context.registry_view.write().await = Some(view.clone());
                 view
             };
-            let mut packages = installed::scan(&context.user_config, &context.state)?;
+            let mut packages = installed::scan_with_manager_root(
+                &context.user_config,
+                &context.state,
+                &context.extension_root,
+            )?;
             let receipts = context.state.receipts()?;
             let managed_versions: Vec<_> = packages
                 .iter()
@@ -777,10 +785,7 @@ async fn handle_request(context: Arc<Context>, method: Method, params: Value) ->
                 }
             }
 
-            if let Some(manager) = packages
-                .iter()
-                .find(|package| package.name.eq_ignore_ascii_case(MANAGER_NAME))
-            {
+            if let Some(manager) = packages.iter().find(|package| package.is_self) {
                 match context
                     .github
                     .latest_manager_release(MANAGER_OWNER, MANAGER_REPOSITORY)
@@ -846,6 +851,7 @@ async fn handle_request(context: Arc<Context>, method: Method, params: Value) ->
         }
         Method::PrepareRollback => {
             let params: PackageNameParams = decode_params(params)?;
+            reject_self_name(&params.name)?;
             let receipt = context.state.read_receipt(&params.name)?;
             let installed = installed::find(&context.user_config, &context.state, &params.name)?;
             let installation_matches_receipt = match (&receipt, &installed) {
@@ -1174,6 +1180,7 @@ fn self_update_recovery_error(
 }
 
 fn verify_install(context: &Context, params: VerifyInstallParams) -> RpcResult<Value> {
+    reject_self_name(&params.name)?;
     let artifact = trusted_artifact_path(&context.state, &params.artifact_path)?;
     let prepared = package::validate_and_stage(
         &context.state,
@@ -1276,7 +1283,11 @@ fn trusted_artifact_path(state: &State, path: &Path) -> RpcResult<PathBuf> {
 }
 
 fn reject_self_update(package: &PreparedPackage) -> RpcResult<()> {
-    if package.name.eq_ignore_ascii_case(MANAGER_NAME) {
+    reject_self_name(&package.name)
+}
+
+fn reject_self_name(name: &str) -> RpcResult<()> {
+    if name.eq_ignore_ascii_case(MANAGER_NAME) {
         return Err(RpcError::invalid(
             "SELF_UPDATE_RESTRICTED",
             "use the manager's dedicated update action for Aseprite Extension Manager releases",
@@ -1589,6 +1600,9 @@ mod tests {
         };
         let error = reject_self_update(&package).expect_err("restricted");
         assert_eq!(error.code, "SELF_UPDATE_RESTRICTED");
+        let direct_error = reject_self_name("ASEPRITE-EXTENSION-MANAGER")
+            .expect_err("case-insensitive manager name is restricted");
+        assert_eq!(direct_error.code, "SELF_UPDATE_RESTRICTED");
     }
 
     #[test]

@@ -8,7 +8,6 @@ Controller.__index = Controller
 
 local STARTUP_INTERVAL_SECONDS = 24 * 60 * 60
 local SELF_UPDATE_DELAY_SECONDS = 0.5
-local MANAGER_NAME = "aseprite-extension-manager"
 
 local function list_from(result, primary, secondary)
   if type(result) ~= "table" then
@@ -41,14 +40,45 @@ local function requested_version(package)
 end
 
 local function is_manager_package(package)
-  return type(package) == "table"
-    and tostring(package.name or ""):lower() == MANAGER_NAME
+  return Model.is_manager_installed_package(package)
 end
 
 local function is_self_update(package)
   return is_manager_package(package)
     and type(package.update) == "table"
     and package.update.kind == "self"
+end
+
+local function manager_update_version(package)
+  if not is_self_update(package) then
+    return nil
+  end
+  local version = package.update.version
+  if type(version) ~= "string" or not version:match("^%d+%.%d+%.%d+$") then
+    return nil
+  end
+  return version
+end
+
+local function find_manager_package(packages)
+  for _, package in ipairs(packages or {}) do
+    if is_manager_package(package) then
+      return package
+    end
+  end
+  return nil
+end
+
+local function is_manager_update_entry(entry)
+  if type(entry) ~= "table" then
+    return false
+  end
+  if is_self_update(entry) then
+    return true
+  end
+  return Model.is_manager_name(entry.packageName or entry.name)
+    and type(entry.update) == "table"
+    and entry.update.kind == "self"
 end
 
 function Controller.new(environment)
@@ -59,6 +89,8 @@ function Controller.new(environment)
     model = Model.new(6),
     rpc = environment.rpc,
     startupTimer = nil,
+    startupOfferTimer = nil,
+    pendingStartupManagerUpdateVersion = nil,
     selfUpdateTimer = nil,
     activeOperation = nil,
     refreshGeneration = 0,
@@ -75,6 +107,7 @@ function Controller.new(environment)
   if preferences.startupChecks == nil then
     preferences.startupChecks = true
   end
+  self:_restore_pending_manager_update()
   return self
 end
 
@@ -87,6 +120,70 @@ end
 
 function Controller:_compatible()
   return Compat.check(self.app)
+end
+
+function Controller:_pending_manager_update_version()
+  local preferences = self.plugin.preferences
+  local version = preferences.deferredManagerUpdateVersion
+  if type(version) == "string"
+    and version:match("^%d+%.%d+%.%d+$")
+    and Compat.compare_versions(tostring(self.plugin.version or "0.0.0"), version) < 0
+  then
+    return version
+  end
+  preferences.deferredManagerUpdateVersion = nil
+  return nil
+end
+
+function Controller:_restore_pending_manager_update()
+  local version = self:_pending_manager_update_version()
+  if not version then
+    return self.model.managerPackage
+  end
+
+  local manager = self.model.managerPackage
+  if not manager then
+    manager = {
+      name = Model.MANAGER_NAME,
+      displayName = "Aseprite Extension Manager",
+      version = tostring(self.plugin.version or "0.0.0"),
+      isSelf = true,
+      managed = false,
+    }
+    self.model.managerPackage = manager
+  end
+  if not is_self_update(manager) then
+    manager.update = {
+      kind = "self",
+      version = version,
+      deferred = true,
+    }
+  end
+  return manager
+end
+
+function Controller:_apply_manager_update_check(manager)
+  if not manager then
+    return self:_restore_pending_manager_update()
+  end
+
+  self.model.managerPackage = manager
+  local version = manager_update_version(manager)
+  if version
+    and Compat.compare_versions(tostring(self.plugin.version or "0.0.0"), version) < 0
+  then
+    self.plugin.preferences.deferredManagerUpdateVersion = version
+    return manager
+  end
+
+  if manager.updateError then
+    return self:_restore_pending_manager_update()
+  end
+  self.plugin.preferences.deferredManagerUpdateVersion = nil
+  if type(manager.update) == "table" and manager.update.kind == "self" then
+    manager.update = nil
+  end
+  return manager
 end
 
 function Controller:_compatibility_params()
@@ -130,6 +227,74 @@ function Controller:_stop_self_update_timer()
   end
 end
 
+function Controller:_stop_startup_offer_timer()
+  if self.startupOfferTimer then
+    pcall(function()
+      self.startupOfferTimer:stop()
+    end)
+    self.startupOfferTimer = nil
+  end
+end
+
+function Controller:_offer_pending_startup_manager_update()
+  if self.closed then
+    self.pendingStartupManagerUpdateVersion = nil
+    self:_stop_startup_offer_timer()
+    return false, false
+  end
+  if not self.pendingStartupManagerUpdateVersion
+    or self.model.busy
+    or self.activeOperation
+  then
+    return false, false
+  end
+
+  local manager = self.model.managerPackage
+  local version = manager_update_version(manager)
+  if not version then
+    self.pendingStartupManagerUpdateVersion = nil
+    self:_stop_startup_offer_timer()
+    return false, false
+  end
+
+  self.pendingStartupManagerUpdateVersion = nil
+  self:_stop_startup_offer_timer()
+  return true, self:update_package(manager) == true
+end
+
+function Controller:_schedule_pending_startup_manager_update()
+  if self.closed or not self.pendingStartupManagerUpdateVersion then
+    return
+  end
+  if not self.model.busy and not self.activeOperation then
+    return
+  end
+  if self.startupOfferTimer or not self.environment.Timer then
+    return
+  end
+
+  local timer
+  timer = self.environment.Timer {
+    interval = 0.1,
+    ontick = function()
+      if self.closed or not self.pendingStartupManagerUpdateVersion then
+        self:_stop_startup_offer_timer()
+        return
+      end
+      if self.model.busy or self.activeOperation then
+        return
+      end
+
+      local _, update_started = self:_offer_pending_startup_manager_update()
+      if not self.ui.dialog and not update_started then
+        self:_shutdown_rpc()
+      end
+    end,
+  }
+  self.startupOfferTimer = timer
+  timer:start()
+end
+
 function Controller:open()
   if not self.app.isUIAvailable then
     return false, "ui_unavailable"
@@ -165,7 +330,7 @@ function Controller:_startup_check_due()
 end
 
 function Controller:schedule_startup_check()
-  if not self.app.isUIAvailable then
+  if self.closed or not self.app.isUIAvailable then
     return false
   end
   local compatible = self:_compatible()
@@ -193,7 +358,7 @@ function Controller:schedule_startup_check()
 end
 
 function Controller:run_startup_check()
-  if not self.app.isUIAvailable or not self:_startup_check_due() then
+  if self.closed or not self.app.isUIAvailable or not self:_startup_check_due() then
     return false
   end
   local compatible = self:_compatible()
@@ -204,16 +369,47 @@ function Controller:run_startup_check()
   self.plugin.preferences.lastStartupCheckAt = self:_now()
   self:_ensure_rpc():request("listUpdates", self:_compatibility_params(), {
     onSuccess = function(result)
-      local updates = list_from(result, "updates", "packages")
-      if #updates > 0 then
-        local suffix = #updates == 1 and "update is" or "updates are"
-        self.app.tip(tostring(#updates) .. " " .. suffix .. " available.", 8)
+      if self.closed then
+        return
       end
-      if not self.ui.dialog then
+      local updates = list_from(result, "updates", "packages")
+      local ordinary_update_count = 0
+      for _, update in ipairs(updates) do
+        if not is_manager_update_entry(update) then
+          ordinary_update_count = ordinary_update_count + 1
+        end
+      end
+      if ordinary_update_count > 0 then
+        local suffix = ordinary_update_count == 1 and "update is" or "updates are"
+        self.app.tip(tostring(ordinary_update_count) .. " " .. suffix .. " available.", 8)
+      end
+
+      local manager = find_manager_package(list_from(result, "packages"))
+      manager = self:_apply_manager_update_check(manager)
+      self.model:set_update_errors(list_from(result, "updateErrors"))
+      if self.ui.dialog then
+        self.ui:refresh()
+      end
+
+      local update_started = false
+      if manager_update_version(manager) then
+        self.pendingStartupManagerUpdateVersion = manager_update_version(manager)
+        _, update_started =
+          self:_offer_pending_startup_manager_update()
+        self:_schedule_pending_startup_manager_update()
+      end
+      local update_deferred = self.pendingStartupManagerUpdateVersion ~= nil
+      if not self.ui.dialog
+        and not update_started
+        and not update_deferred
+      then
         self:_shutdown_rpc()
       end
     end,
     onError = function()
+      if self.closed then
+        return
+      end
       if not self.ui.dialog then
         self:_shutdown_rpc()
       end
@@ -241,6 +437,7 @@ function Controller:refresh(show_errors)
         return
       end
       self.model:set_installed(list_from(result, "packages", "installed"))
+      self:_restore_pending_manager_update()
       self.model.status = "Refreshing catalog…"
       self.ui:refresh()
 
@@ -264,6 +461,7 @@ function Controller:refresh(show_errors)
                 return
               end
               self.model:set_installed(list_from(updates, "packages"))
+              self:_apply_manager_update_check(self.model.managerPackage)
               self.model:set_update_errors(list_from(updates, "updateErrors"))
               self.model.busy = false
               if registry.expired then
@@ -639,7 +837,7 @@ function Controller:_install_artifact(operation, artifact, restore_context)
   end
 
   if artifact.selfUpdate == true then
-    if not is_manager_package(artifact)
+    if not Model.is_manager_name(artifact.name)
       or artifact.restartRequired ~= true
       or type(artifact.recoveryArtifact) ~= "string"
       or artifact.recoveryArtifact == ""
@@ -824,7 +1022,11 @@ function Controller:sync_local_folder()
 end
 
 function Controller:install_registry_package(package)
-  if self.model.registryExpired or package.yanked or self.activeOperation then
+  if self.model.registryExpired
+    or package.yanked
+    or self.activeOperation
+    or Model.is_manager_catalog_package(package)
+  then
     return false
   end
   local operation = self:_begin_operation("Install Extension", "Preparing the catalog package…")
@@ -863,12 +1065,18 @@ function Controller:update_package(package)
   if self.activeOperation or (not package.managed and not self_update) then
     return false
   end
+  local update = type(package.update) == "table" and package.update or {}
   if self_update and not self.ui:confirm(
     "Update Extension Manager",
-    "The helper will download the official stable release and save a recovery package. "
+    "Aseprite Extension Manager v"
+      .. tostring(update.version or "new")
+      .. " is available. You currently have v"
+      .. tostring(package.version or self.plugin.version or "unknown")
+      .. ".\n\nThe helper will download the official stable release and save a recovery package. "
       .. "It must stop before Aseprite replaces the manager, and you must restart Aseprite afterward. "
       .. "If startup verification fails, the manager will show the recovery package path.",
-    "Prepare Update"
+    "Update Now",
+    "Later"
   ) then
     return false
   end
@@ -880,7 +1088,6 @@ function Controller:update_package(package)
   if not operation then
     return false
   end
-  local update = type(package.update) == "table" and package.update or {}
   local method = self_update and "prepareSelfUpdate" or "preparePackage"
   local params = {}
   if not self_update then
@@ -992,6 +1199,9 @@ function Controller:clear_cache()
 end
 
 function Controller:open_native_extension_preferences(action, package)
+  if is_manager_package(package) then
+    return false
+  end
   local package_name = package and (package.displayName or package.name)
     or "the extension"
   local instruction
@@ -1044,6 +1254,8 @@ end
 function Controller:close()
   self.closed = true
   self:_stop_self_update_timer()
+  self:_stop_startup_offer_timer()
+  self.pendingStartupManagerUpdateVersion = nil
   if self.startupTimer then
     pcall(function()
       self.startupTimer:stop()

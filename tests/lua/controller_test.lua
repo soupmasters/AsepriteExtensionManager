@@ -44,6 +44,35 @@ local function controller_fixture(options)
   return controller, app, calls, plugin, rpc, ui, timers
 end
 
+local function manager_update_result(version)
+  version = version or "0.2.0"
+  return {
+    packages = {
+      {
+        name = "aseprite-extension-manager",
+        displayName = "Aseprite Extension Manager",
+        version = "0.1.0",
+        isSelf = true,
+        managed = false,
+        update = {
+          kind = "self",
+          version = version,
+        },
+      },
+    },
+    updates = {
+      {
+        packageName = "aseprite-extension-manager",
+        update = {
+          kind = "self",
+          version = version,
+        },
+      },
+    },
+    updateErrors = {},
+  }
+end
+
 Test.case("batch mode performs no UI or helper work", function()
   local controller, _, _, _, rpc, ui = controller_fixture {
     isUIAvailable = false,
@@ -81,13 +110,19 @@ Test.case("first-run cancellation does not launch the helper", function()
 end)
 
 Test.case("opening manager scans catalog and attaches update state", function()
-  local controller, _, _, _, rpc, ui = controller_fixture()
+  local controller, _, _, plugin, rpc, ui = controller_fixture()
   Test.truthy(controller:open())
   Test.truthy(ui.opened)
   Test.equal(rpc.requests[1].method, "scanInstalled")
 
   rpc:respond(1, {
     packages = {
+      {
+        name = "aseprite-extension-manager",
+        isSelf = true,
+        version = "0.1.0",
+        managed = false,
+      },
       {
         name = "one",
         version = "1.0.0",
@@ -98,7 +133,19 @@ Test.case("opening manager scans catalog and attaches update state", function()
   Test.equal(rpc.requests[2].method, "refreshRegistry")
   rpc:respond(2, {
     status = "current",
-    packages = {},
+    packages = {
+      {
+        id = "aseprite-extension-manager",
+        manifestName = "aseprite-extension-manager",
+        displayName = "Aseprite Extension Manager",
+      },
+      {
+        id = "catalog-one",
+        manifestName = "catalog-one",
+        displayName = "Catalog One",
+        releases = {},
+      },
+    },
     expired = false,
     fromCache = false,
   })
@@ -108,6 +155,17 @@ Test.case("opening manager scans catalog and attaches update state", function()
   Test.truthy(controller.model.busy)
   rpc:respond(3, {
     packages = {
+      {
+        name = "aseprite-extension-manager",
+        isSelf = true,
+        version = "0.1.0",
+        managed = false,
+        rollbackAvailable = true,
+        update = {
+          kind = "self",
+          version = "0.2.0",
+        },
+      },
       {
         name = "one",
         version = "1.0.0",
@@ -127,6 +185,13 @@ Test.case("opening manager scans catalog and attaches update state", function()
     },
     updateErrors = {
       {
+        packageName = "aseprite-extension-manager",
+        error = {
+          code = "network",
+          message = "Manager recovery information.",
+        },
+      },
+      {
         packageName = "one",
         error = {
           code = "network",
@@ -137,10 +202,55 @@ Test.case("opening manager scans catalog and attaches update state", function()
   })
   Test.equal(#controller.model.installed, 1)
   Test.equal(controller.model.installed[1].update.version, "1.1.0")
+  Test.equal(controller.model.managerPackage.update.kind, "self")
+  Test.equal(plugin.preferences.deferredManagerUpdateVersion, "0.2.0")
+  Test.truthy(controller.model.managerPackage.rollbackAvailable)
+  Test.equal(#controller.model.catalog, 1)
+  Test.equal(controller.model.catalog[1].id, "catalog-one")
+  Test.equal(controller.model.managerCatalogPackage.id, "aseprite-extension-manager")
   Test.equal(#controller.model.updateErrors, 1)
   Test.falsy(controller.model.busy)
   Test.contains(controller.model.status, "1 installed")
   Test.contains(controller.model.status, "1 update source unavailable")
+end)
+
+Test.case("refresh failure cannot erase a deferred manager update", function()
+  local preferences = {
+    onboardingVersion = 1,
+    startupChecks = true,
+    deferredManagerUpdateVersion = "0.2.0",
+  }
+  local controller, _, _, plugin, rpc = controller_fixture {
+    preferences = preferences,
+  }
+  Test.truthy(controller:open())
+  rpc:respond(1, {
+    packages = {
+      {
+        name = "aseprite-extension-manager",
+        version = "0.1.0",
+        isSelf = true,
+        managed = false,
+      },
+    },
+  })
+  Test.equal(controller.model.managerPackage.update.version, "0.2.0")
+  Test.truthy(controller.model.managerPackage.update.deferred)
+
+  rpc:respond(2, {
+    status = "current",
+    packages = {},
+    expired = false,
+    fromCache = false,
+  })
+  rpc:fail(3, {
+    code = "network",
+    message = "offline",
+  })
+
+  Test.equal(plugin.preferences.deferredManagerUpdateVersion, "0.2.0")
+  Test.equal(controller.model.managerPackage.update.version, "0.2.0")
+  Test.truthy(controller.model.managerPackage.update.deferred)
 end)
 
 Test.case("startup checks run at most daily and notify for eight seconds", function()
@@ -181,13 +291,179 @@ Test.case("startup checks run at most daily and notify for eight seconds", funct
   Test.equal(#later_rpc.requests, 0)
 end)
 
-Test.case("startup network failure is silent", function()
-  local controller, _, calls, _, rpc, ui, timers = controller_fixture {
+Test.case("declining a startup manager update keeps a persistent update action", function()
+  local now = 200000
+  local preferences = {
+    onboardingVersion = 1,
+    startupChecks = true,
+    lastStartupCheckAt = 0,
+  }
+  local controller, _, calls, plugin, rpc, ui, timers = controller_fixture {
+    now = now,
+    preferences = preferences,
+    confirms = {
+      false,
+    },
+  }
+
+  Test.truthy(controller:schedule_startup_check())
+  timers[1]:fire()
+  rpc:respond(1, manager_update_result())
+
+  Test.equal(#ui.confirmations, 1)
+  Test.equal(ui.confirmations[1].title, "Update Extension Manager")
+  Test.equal(ui.confirmations[1].confirmText, "Update Now")
+  Test.equal(ui.confirmations[1].cancelText, "Later")
+  Test.contains(ui.confirmations[1].message, "v0.2.0")
+  Test.contains(ui.confirmations[1].message, "v0.1.0")
+  Test.equal(#rpc.requests, 1)
+  Test.equal(rpc.shutdownCount, 1)
+  Test.equal(#calls.tips, 0, "manager update must not produce a duplicate generic tip")
+  Test.equal(plugin.preferences.deferredManagerUpdateVersion, "0.2.0")
+  Test.equal(controller.model.managerPackage.update.kind, "self")
+  Test.equal(controller.model.managerPackage.update.version, "0.2.0")
+
+  local later_controller, _, _, _, later_rpc = controller_fixture {
+    now = now + 60,
+    preferences = preferences,
+  }
+  Test.falsy(later_controller:schedule_startup_check())
+  Test.equal(#later_rpc.requests, 0)
+  Test.equal(later_controller.model.managerPackage.update.kind, "self")
+  Test.equal(later_controller.model.managerPackage.update.version, "0.2.0")
+  Test.truthy(later_controller.model.managerPackage.update.deferred)
+end)
+
+Test.case("accepting the startup manager prompt begins one dedicated update", function()
+  local controller, _, _, _, rpc, ui, timers = controller_fixture {
     now = 200000,
     preferences = {
       onboardingVersion = 1,
       startupChecks = true,
       lastStartupCheckAt = 0,
+    },
+    confirms = {
+      true,
+    },
+  }
+
+  controller:schedule_startup_check()
+  timers[1]:fire()
+  rpc:respond(1, manager_update_result())
+
+  Test.equal(#ui.confirmations, 1)
+  Test.equal(#rpc.requests, 2)
+  Test.equal(rpc.requests[2].method, "prepareSelfUpdate")
+  Test.equal(next(rpc.requests[2].params), nil)
+  Test.equal(rpc.shutdownCount, 0, "helper must remain available while update prepares")
+end)
+
+Test.case("authoritative no-update startup result clears a deferred manager update", function()
+  local preferences = {
+    onboardingVersion = 1,
+    startupChecks = true,
+    lastStartupCheckAt = 0,
+    deferredManagerUpdateVersion = "0.2.0",
+  }
+  local controller, _, _, plugin, rpc, ui, timers = controller_fixture {
+    now = 200000,
+    preferences = preferences,
+  }
+  Test.truthy(controller.model.managerPackage.update.deferred)
+
+  controller:schedule_startup_check()
+  timers[1]:fire()
+  rpc:respond(1, {
+    packages = {
+      {
+        name = "aseprite-extension-manager",
+        version = "0.2.0",
+        isSelf = true,
+        managed = false,
+      },
+    },
+    updates = {},
+    updateErrors = {},
+  })
+
+  Test.equal(plugin.preferences.deferredManagerUpdateVersion, nil)
+  Test.equal(controller.model.managerPackage.update, nil)
+  Test.equal(#ui.confirmations, 0)
+end)
+
+Test.case("busy manager refresh defers the startup prompt but keeps its arrow", function()
+  local controller, _, _, plugin, rpc, ui, timers = controller_fixture {
+    now = 200000,
+    preferences = {
+      onboardingVersion = 1,
+      startupChecks = true,
+      lastStartupCheckAt = 0,
+    },
+    confirms = {
+      true,
+    },
+  }
+  controller.model.busy = true
+  ui.dialog = {}
+
+  controller:schedule_startup_check()
+  timers[1]:fire()
+  rpc:respond(1, manager_update_result())
+
+  Test.equal(#ui.confirmations, 0)
+  Test.equal(#rpc.requests, 1)
+  Test.equal(rpc.shutdownCount, 0)
+  Test.equal(plugin.preferences.deferredManagerUpdateVersion, "0.2.0")
+  Test.equal(controller.model.managerPackage.update.version, "0.2.0")
+  Test.equal(#timers, 2)
+  Test.truthy(timers[2].started)
+
+  timers[2]:fire()
+  Test.equal(#ui.confirmations, 0, "the offer must wait while refresh is busy")
+  Test.falsy(timers[2].stopped)
+
+  controller.model.busy = false
+  timers[2]:fire()
+  Test.equal(#ui.confirmations, 1)
+  Test.equal(ui.confirmations[1].confirmText, "Update Now")
+  Test.equal(ui.confirmations[1].cancelText, "Later")
+  Test.equal(rpc.requests[2].method, "prepareSelfUpdate")
+  Test.equal(controller.pendingStartupManagerUpdateVersion, nil)
+  Test.truthy(timers[2].stopped)
+end)
+
+Test.case("late startup results cannot prompt after controller shutdown", function()
+  local controller, _, _, plugin, rpc, ui, timers = controller_fixture {
+    now = 200000,
+    preferences = {
+      onboardingVersion = 1,
+      startupChecks = true,
+      lastStartupCheckAt = 0,
+    },
+    confirms = {
+      true,
+    },
+  }
+
+  controller:schedule_startup_check()
+  timers[1]:fire()
+  controller:close()
+  rpc:respond(1, manager_update_result())
+
+  Test.equal(#ui.confirmations, 0)
+  Test.equal(#rpc.requests, 1)
+  Test.equal(plugin.preferences.deferredManagerUpdateVersion, nil)
+  Test.equal(controller.pendingStartupManagerUpdateVersion, nil)
+end)
+
+Test.case("startup network failure is silent", function()
+  local controller, _, calls, plugin, rpc, ui, timers = controller_fixture {
+    now = 200000,
+    preferences = {
+      onboardingVersion = 1,
+      startupChecks = true,
+      lastStartupCheckAt = 0,
+      deferredManagerUpdateVersion = "0.2.0",
     },
   }
   controller:schedule_startup_check()
@@ -199,6 +475,8 @@ Test.case("startup network failure is silent", function()
   })
   Test.equal(#calls.tips, 0)
   Test.equal(#ui.errors, 0)
+  Test.equal(plugin.preferences.deferredManagerUpdateVersion, "0.2.0")
+  Test.equal(controller.model.managerPackage.update.version, "0.2.0")
 end)
 
 Test.case("GitHub operation cancellation stops the pending request", function()
@@ -298,6 +576,17 @@ Test.case("native extension preferences are followed by a rescan", function()
   Test.contains(calls.alerts[1].text, "Choose Extensions")
   Test.equal(#calls.options, 1)
   Test.equal(rpc.requests[1].method, "scanInstalled")
+end)
+
+Test.case("manager cannot open native disable or uninstall preferences", function()
+  local controller, _, calls, _, rpc = controller_fixture()
+  Test.falsy(controller:open_native_extension_preferences("uninstall", {
+    name = "ASEPRITE-EXTENSION-MANAGER",
+    isSelf = true,
+  }))
+  Test.equal(#calls.alerts, 0)
+  Test.equal(#calls.options, 0)
+  Test.equal(#rpc.requests, 0)
 end)
 
 Test.case("verification RPC errors offer an immediate managed restore", function()
@@ -463,6 +752,7 @@ Test.case("unmanaged manager updates use the dedicated safe self-update flow", f
   }
   Test.truthy(controller:update_package({
     name = "aseprite-extension-manager",
+    isSelf = true,
     version = "0.1.0",
     managed = false,
     update = {
@@ -513,6 +803,7 @@ Test.case("manager self-update confirmation can cancel before creating a transac
   }
   Test.falsy(controller:update_package({
     name = "aseprite-extension-manager",
+    isSelf = true,
     version = "0.1.0",
     managed = false,
     update = {
@@ -532,6 +823,7 @@ Test.case("manager self-update refuses an incomplete recovery transaction", func
   }
   controller:update_package({
     name = "aseprite-extension-manager",
+    isSelf = true,
     version = "0.1.0",
     managed = false,
     update = {
@@ -561,6 +853,7 @@ Test.case("manager restore uses the dedicated self-rollback flow", function()
   }
   Test.truthy(controller:restore_package({
     name = "aseprite-extension-manager",
+    isSelf = true,
     version = "0.2.0",
     rollbackAvailable = true,
   }))
@@ -590,6 +883,7 @@ Test.case("closing the controller stops a pending self-update install timer", fu
   }
   controller:update_package({
     name = "aseprite-extension-manager",
+    isSelf = true,
     version = "0.1.0",
     managed = false,
     update = {
@@ -625,6 +919,18 @@ Test.case("catalog preparation forwards host compatibility", function()
   Test.equal(rpc.requests[1].params.version, "2.0.0")
   Test.equal(rpc.requests[1].params.asepriteVersion, "1.3.15")
   Test.equal(rpc.requests[1].params.apiVersion, 35)
+end)
+
+Test.case("manager catalog entry cannot use the generic install flow", function()
+  local controller, _, _, _, rpc = controller_fixture()
+  Test.falsy(controller:install_registry_package({
+    id = "ASEPRITE-EXTENSION-MANAGER",
+    manifestName = "aseprite-extension-manager",
+    latest = {
+      version = "0.2.0",
+    },
+  }))
+  Test.equal(#rpc.requests, 0)
 end)
 
 Test.case("controller close cancels active work and shuts down the helper", function()

@@ -1,9 +1,15 @@
 local Protocol = require("aem.protocol")
+local Model = require("aem.model")
 
 local Ui = {}
 Ui.__index = Ui
 
-local MANAGER_NAME = "aseprite-extension-manager"
+local REPOSITORY_URL = "https://github.com/soupmasters/AsepriteExtensionManager"
+local REPOSITORY_LINK_TEXT = "View on GitHub"
+local REPOSITORY_LINK_WIDTH = 120
+local REPOSITORY_LINK_HEIGHT = 16
+local LEFT_MOUSE_BUTTON = MouseButton and MouseButton.LEFT or 1
+local POINTER_CURSOR = MouseCursor and MouseCursor.POINTER or nil
 local RESIZE_DEBOUNCE_SECONDS = 0.1
 local FALLBACK_INLINE_WIDTH = 560
 local WIDTH_PRESERVING_AUTOFIT = Align and Align.TOP or 0
@@ -21,6 +27,57 @@ local function manager_version(plugin)
     return "Unknown"
   end
   return tostring(value)
+end
+
+local function fallback_link_color()
+  local components = {
+    r = 79,
+    g = 148,
+    b = 255,
+    a = 255,
+  }
+  if Color then
+    return Color(components)
+  end
+  return components
+end
+
+local function themed_link_color(context, active)
+  local ok, value = pcall(function()
+    return active and context.theme.color.link_hover or context.theme.color.link_text
+  end)
+  if ok and value then
+    return value
+  end
+  return fallback_link_color()
+end
+
+local function paint_link(event, label, active)
+  local context = event.context
+  local measured = context:measureText(label)
+  local text_width = tonumber(measured.width) or 0
+  local text_height = tonumber(measured.height) or 0
+  local canvas_width = tonumber(context.width) or text_width
+  local canvas_height = tonumber(context.height) or text_height + 1
+  local underline_y = math.min(text_height, math.max(canvas_height - 1, 0))
+
+  context.color = themed_link_color(context, active)
+  context:fillText(label, 0, 0)
+  context.strokeWidth = 1
+  context:beginPath()
+  context:moveTo(0, underline_y)
+  context:lineTo(math.min(text_width, canvas_width), underline_y)
+  context:stroke()
+end
+
+local function inside_repository_link(event)
+  return event
+    and tonumber(event.x)
+    and tonumber(event.y)
+    and event.x >= 0
+    and event.x < REPOSITORY_LINK_WIDTH
+    and event.y >= 0
+    and event.y < REPOSITORY_LINK_HEIGHT
 end
 
 local function source_label(source)
@@ -44,9 +101,17 @@ local function source_label(source)
 end
 
 local function self_update_available(package)
-  return tostring(package.name or ""):lower() == MANAGER_NAME
+  return Model.is_manager_installed_package(package)
     and type(package.update) == "table"
     and package.update.kind == "self"
+end
+
+local function recovery_artifact(package)
+  return type(package) == "table"
+      and type(package.updateError) == "table"
+      and type(package.updateError.details) == "table"
+      and package.updateError.details.recoveryArtifact
+    or nil
 end
 
 local function author_name(author)
@@ -677,6 +742,19 @@ function Ui:_build()
     dialog:newrow()
   end
   dialog:button {
+    id = "manager_update",
+    text = "↑",
+    visible = false,
+    focus = false,
+    hexpand = false,
+    onclick = function()
+      local manager = self.model.managerPackage
+      if self_update_available(manager) then
+        self.controller:update_package(manager)
+      end
+    end,
+  }
+  dialog:button {
     id = "refresh",
     text = "↻",
     focus = false,
@@ -696,7 +774,7 @@ function Ui:_build()
   }
   dialog:button {
     id = "help",
-    text = "?",
+    text = "⍰",
     focus = false,
     hexpand = false,
     onclick = function()
@@ -799,9 +877,24 @@ function Ui:refresh()
     self.supportsSameRow
   )
 
+  local manager_update = self_update_available(self.model.managerPackage)
+  local status = self.model.status
+  if manager_update then
+    local version = self.model.managerPackage.update.version
+    if version then
+      status = status .. " · Manager update v" .. tostring(version) .. " available"
+    else
+      status = status .. " · Manager update available"
+    end
+  end
   dialog:modify {
     id = "manager_status",
-    text = self.model.status,
+    text = status,
+  }
+  dialog:modify {
+    id = "manager_update",
+    visible = manager_update,
+    enabled = manager_update and not self.model.busy,
   }
   for _, id in ipairs({
     "install",
@@ -872,7 +965,7 @@ function Ui:show_error(title, error_value)
   show_responsive(dialog)
 end
 
-function Ui:confirm(title, message, confirm_text)
+function Ui:confirm(title, message, confirm_text, cancel_text)
   local dialog = self.environment.Dialog {
     title = title,
     parent = self:_parent(),
@@ -889,7 +982,7 @@ function Ui:confirm(title, message, confirm_text)
   }
   dialog:button {
     id = "cancel_action",
-    text = "Cancel",
+    text = cancel_text or "Cancel",
   }
   show_responsive(dialog)
   return dialog.data.confirm_action == true
@@ -1079,6 +1172,103 @@ function Ui:show_help()
     label = "Created by:",
     text = "Martin Calander · Soupmasters",
   }
+  dialog:label {
+    id = "help_license",
+    label = "License:",
+    text = "MIT License",
+  }
+  local repository_link_pressed = false
+  dialog:canvas {
+    id = "help_repository",
+    label = "Repository:",
+    width = REPOSITORY_LINK_WIDTH,
+    height = REPOSITORY_LINK_HEIGHT,
+    hexpand = false,
+    vexpand = false,
+    onpaint = function(event)
+      paint_link(event, REPOSITORY_LINK_TEXT, repository_link_pressed)
+    end,
+    onmousedown = function(event)
+      repository_link_pressed = event.button == LEFT_MOUSE_BUTTON
+        and inside_repository_link(event)
+      dialog:repaint()
+    end,
+    onmouseup = function(event)
+      local should_open = repository_link_pressed
+        and event.button == LEFT_MOUSE_BUTTON
+        and inside_repository_link(event)
+      repository_link_pressed = false
+      dialog:repaint()
+      if should_open then
+        self.app.command.Launch {
+          path = REPOSITORY_URL,
+        }
+      end
+    end,
+  }
+  if POINTER_CURSOR then
+    pcall(function()
+      dialog:modify {
+        id = "help_repository",
+        mouseCursor = POINTER_CURSOR,
+      }
+    end)
+  end
+  local manager = self.model.managerPackage
+  if manager then
+    dialog:separator { text = "Manager Updates" }
+    if manager.update then
+      local update_version = type(manager.update) == "table" and manager.update.version
+        or manager.update
+      dialog:label {
+        label = "Update:",
+        text = text(update_version, "Available"),
+      }
+    end
+    if manager.updateError then
+      dialog:label {
+        label = "Update check:",
+        text = Protocol.error_message(manager.updateError),
+        hexpand = true,
+      }
+    elseif not manager.update and self.model.busy then
+      dialog:label {
+        label = "Update check:",
+        text = "Checking…",
+      }
+    elseif not manager.update then
+      dialog:label {
+        label = "Update check:",
+        text = "Up to date",
+      }
+    end
+    local recovery = recovery_artifact(manager)
+    if type(recovery) == "string" and recovery ~= "" then
+      dialog:label {
+        label = "Recovery package:",
+        text = recovery,
+        hexpand = true,
+      }
+    end
+    if self_update_available(manager) then
+      dialog:button {
+        text = "Update Manager…",
+        onclick = function()
+          dialog:close()
+          self.controller:update_package(manager)
+        end,
+      }
+    end
+    if manager.rollbackAvailable then
+      dialog:button {
+        text = "Restore Manager…",
+        onclick = function()
+          dialog:close()
+          self.controller:restore_package(manager)
+        end,
+      }
+    end
+  end
   show_responsive(dialog)
 end
 
@@ -1133,6 +1323,9 @@ function Ui:show_preferences()
 end
 
 function Ui:show_package_details(package, kind)
+  local manager_package = kind == "installed"
+      and Model.is_manager_installed_package(package)
+    or Model.is_manager_catalog_package(package)
   local dialog = self.environment.Dialog {
     title = package_title(package),
     parent = self:_parent(),
@@ -1190,14 +1383,11 @@ function Ui:show_package_details(package, kind)
         text = Protocol.error_message(package.updateError),
         hexpand = true,
       }
-      local recovery_artifact = type(package.updateError) == "table"
-          and type(package.updateError.details) == "table"
-          and package.updateError.details.recoveryArtifact
-        or nil
-      if type(recovery_artifact) == "string" and recovery_artifact ~= "" then
+      local recovery = recovery_artifact(package)
+      if type(recovery) == "string" and recovery ~= "" then
         dialog:label {
           label = "Recovery package:",
-          text = recovery_artifact,
+          text = recovery,
           hexpand = true,
         }
       end
@@ -1215,36 +1405,40 @@ function Ui:show_package_details(package, kind)
     end
     if package.rollbackAvailable then
       dialog:button {
-        text = tostring(package.name or ""):lower() == MANAGER_NAME
-            and "Restore Manager…"
-          or "Restore…",
+        text = manager_package and "Restore Manager…" or "Restore…",
         onclick = function()
           dialog:close()
           self.controller:restore_package(package)
         end,
       }
     end
-    dialog:button {
-      text = "Enable / Disable…",
-      onclick = function()
-        dialog:close()
-        self.controller:open_native_extension_preferences("enable_disable", package)
-      end,
-    }
-    dialog:button {
-      text = "Uninstall…",
-      onclick = function()
-        dialog:close()
-        self.controller:open_native_extension_preferences("uninstall", package)
-      end,
-    }
+    if not manager_package then
+      dialog:button {
+        text = "Enable / Disable…",
+        onclick = function()
+          dialog:close()
+          self.controller:open_native_extension_preferences("enable_disable", package)
+        end,
+      }
+      dialog:button {
+        text = "Uninstall…",
+        onclick = function()
+          dialog:close()
+          self.controller:open_native_extension_preferences("uninstall", package)
+        end,
+      }
+    end
   else
     dialog:label {
       label = "Repository:",
       text = text(package.repository),
       hexpand = true,
     }
-    if not package.latest then
+    if manager_package then
+      dialog:label {
+        text = "Manager updates are available from Help.",
+      }
+    elseif not package.latest then
       dialog:label {
         text = "No compatible stable release is available for this Aseprite version.",
       }

@@ -1,8 +1,42 @@
 local Model = {}
 Model.__index = Model
 
+local MANAGER_NAME = "aseprite-extension-manager"
+Model.MANAGER_NAME = MANAGER_NAME
+
 local function folded(value)
   return tostring(value or ""):lower()
+end
+
+function Model.is_manager_name(value)
+  return type(value) == "string" and folded(value) == MANAGER_NAME
+end
+
+function Model.is_manager_catalog_package(package)
+  if type(package) ~= "table" then
+    return false
+  end
+  return Model.is_manager_name(package.id)
+    and Model.is_manager_name(package.manifestName)
+end
+
+function Model.is_manager_installed_package(package)
+  return type(package) == "table"
+    and package.isSelf == true
+    and Model.is_manager_name(package.name)
+end
+
+local function partition_manager(packages, predicate)
+  local visible = {}
+  local manager
+  for _, package in ipairs(packages or {}) do
+    if predicate(package) then
+      manager = manager or package
+    else
+      visible[#visible + 1] = package
+    end
+  end
+  return visible, manager
 end
 
 local function package_text(package)
@@ -30,6 +64,8 @@ function Model.new(page_size)
     catalog = {},
     installed = {},
     updateErrors = {},
+    managerCatalogPackage = nil,
+    managerPackage = nil,
     browseSearch = "",
     installedSearch = "",
     browsePage = 1,
@@ -44,7 +80,10 @@ function Model.new(page_size)
 end
 
 function Model:set_catalog(packages, status, expired, from_cache)
-  self.catalog = packages or {}
+  self.catalog, self.managerCatalogPackage = partition_manager(
+    packages,
+    Model.is_manager_catalog_package
+  )
   self.registryStatus = status or self.registryStatus
   self.registryExpired = expired == true
   self.registryFromCache = from_cache == true
@@ -52,12 +91,23 @@ function Model:set_catalog(packages, status, expired, from_cache)
 end
 
 function Model:set_installed(packages)
-  self.installed = packages or {}
+  self.installed, self.managerPackage = partition_manager(
+    packages,
+    Model.is_manager_installed_package
+  )
   self.installedPage = 1
 end
 
 function Model:set_update_errors(errors)
-  self.updateErrors = errors or {}
+  local visible = {}
+  for _, update_error in ipairs(errors or {}) do
+    if not Model.is_manager_name(update_error.packageName)
+      and not Model.is_manager_installed_package(update_error)
+    then
+      visible[#visible + 1] = update_error
+    end
+  end
+  self.updateErrors = visible
 end
 
 function Model:set_search(kind, value)

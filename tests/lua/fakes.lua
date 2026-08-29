@@ -261,11 +261,12 @@ function Fakes.ui(options)
     return self.assetSelection
   end
 
-  function ui:confirm(title, message, confirm_text)
+  function ui:confirm(title, message, confirm_text, cancel_text)
     self.confirmations[#self.confirmations + 1] = {
       title = title,
       message = message,
       confirmText = confirm_text,
+      cancelText = cancel_text,
     }
     if #self.confirms == 0 then
       return false
@@ -320,6 +321,7 @@ function Fakes.dialog_factory(factory_options)
         width = options.sizeHintWidth or 640,
         height = options.sizeHintHeight or 484,
       },
+      repaintCount = 0,
       shown = nil,
       closed = false,
     }
@@ -352,6 +354,7 @@ function Fakes.dialog_factory(factory_options)
       "combobox",
       "menuItem",
       "file",
+      "canvas",
     }) do
       dialog[kind] = function(_, definition)
         return widget(kind, definition)
@@ -395,6 +398,11 @@ function Fakes.dialog_factory(factory_options)
 
     function dialog:showMenu(show_options)
       self.shownMenu = show_options or true
+      return self
+    end
+
+    function dialog:repaint()
+      self.repaintCount = self.repaintCount + 1
       return self
     end
 

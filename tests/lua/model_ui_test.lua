@@ -43,8 +43,104 @@ Test.case("browse model searches and paginates catalog packages", function()
   Test.equal(filtered_total, 1)
 end)
 
+Test.case("manager is excluded from both package lists regardless of source", function()
+  local manager_catalog = {
+    id = "ASEPRITE-EXTENSION-MANAGER",
+    manifestName = "Aseprite-Extension-Manager",
+    displayName = "Aseprite Extension Manager",
+  }
+  local manager_installed = {
+    name = "Aseprite-Extension-Manager",
+    isSelf = true,
+    displayName = "Aseprite Extension Manager",
+    version = "0.2.0",
+    source = {
+      kind = "local",
+      packageJsonPath = "/work/manager/package.json",
+    },
+    update = {
+      kind = "self",
+      version = "0.3.0",
+    },
+  }
+  local model = Model.new(1)
+  model:set_catalog({
+    manager_catalog,
+    {
+      id = "example",
+      manifestName = "example",
+      displayName = "Example",
+    },
+  }, "current", false, false)
+  model:set_installed({
+    manager_installed,
+    {
+      name = "example",
+      displayName = "Example",
+      source = {
+        kind = "github-release",
+      },
+    },
+  })
+  model:set_update_errors({
+    {
+      packageName = "ASEPRITE-EXTENSION-MANAGER",
+      error = {
+        code = "network",
+      },
+    },
+    {
+      packageName = "example",
+      error = {
+        code = "network",
+      },
+    },
+  })
+
+  Test.equal(#model.catalog, 1)
+  Test.equal(model.catalog[1].id, "example")
+  Test.equal(model.managerCatalogPackage, manager_catalog)
+  Test.equal(#model.installed, 1)
+  Test.equal(model.installed[1].name, "example")
+  Test.equal(model.managerPackage, manager_installed)
+  Test.equal(model.managerPackage.update.kind, "self")
+  Test.equal(#model.updateErrors, 1)
+  Test.equal(model.updateErrors[1].packageName, "example")
+
+  local browse, _, _, browse_total = model:page("browse")
+  local installed, _, _, installed_total = model:page("installed")
+  Test.equal(#browse, 1)
+  Test.equal(browse_total, 1)
+  Test.equal(#installed, 1)
+  Test.equal(installed_total, 1)
+
+  model:set_search("browse", "aseprite-extension-manager")
+  model:set_search("installed", "aseprite extension manager")
+  Test.equal(#model:filtered("browse"), 0)
+  Test.equal(#model:filtered("installed"), 0)
+
+  Test.truthy(Model.is_manager_installed_package({
+    name = "ASEPRITE-EXTENSION-MANAGER",
+    isSelf = true,
+  }))
+  Test.falsy(Model.is_manager_installed_package({
+    name = "aseprite-extension-manager",
+    isSelf = false,
+  }))
+  Test.truthy(Model.is_manager_catalog_package({
+    id = "aseprite-extension-manager",
+    manifestName = "aseprite-extension-manager",
+  }))
+  Test.falsy(Model.is_manager_catalog_package({
+    id = "aseprite-extension-manager",
+  }))
+  Test.falsy(Model.is_manager_catalog_package({
+    displayName = "Aseprite Extension Manager",
+  }))
+end)
+
 Test.case("manager uses compact native install and utility controls", function()
-  local app = Fakes.app {
+  local app, calls = Fakes.app {
     allFilesExist = true,
   }
   local plugin = Fakes.plugin {
@@ -95,16 +191,21 @@ Test.case("manager uses compact native install and utility controls", function()
   local install = manager.widgetsById.install
   Test.equal(install.kind, "button")
   Test.equal(install.definition.text, "Install… +")
+  Test.equal(manager.widgetsById.manager_update.definition.text, "↑")
+  Test.falsy(manager.widgetsById.manager_update.definition.visible)
+  Test.falsy(manager.widgetsById.manager_update.definition.hexpand)
+  Test.truthy(widget_indices.install < widget_indices.manager_update)
+  Test.truthy(widget_indices.manager_update < widget_indices.refresh)
   Test.truthy(buttons["↻"])
   Test.truthy(buttons["⚙"])
-  Test.truthy(buttons["?"])
+  Test.truthy(buttons["⍰"])
   Test.falsy(manager.widgetsById.install_github)
   Test.falsy(manager.widgetsById.sync_local)
   Test.falsy(manager.widgetsById.close)
 
   local help = manager.widgetsById.help
   Test.equal(help.kind, "button")
-  Test.equal(help.definition.text, "?")
+  Test.equal(help.definition.text, "⍰")
   Test.falsy(help.definition.focus)
   Test.falsy(help.definition.hexpand)
   help.definition.onclick()
@@ -116,6 +217,103 @@ Test.case("manager uses compact native install and utility controls", function()
     help_dialog.widgetsById.help_creator.definition.text,
     "Martin Calander · Soupmasters"
   )
+  Test.equal(help_dialog.widgetsById.help_license.definition.text, "MIT License")
+  local repository_link = help_dialog.widgetsById.help_repository
+  Test.equal(repository_link.kind, "canvas")
+  Test.equal(repository_link.definition.label, "Repository:")
+  Test.falsy(repository_link.definition.hexpand)
+  Test.falsy(repository_link.definition.vexpand)
+
+  local painted = {
+    moves = {},
+  }
+  local context = {
+    width = 120,
+    height = 16,
+    theme = {
+      color = {
+        link_text = "link-text",
+        link_hover = "link-hover",
+      },
+    },
+  }
+  function context:measureText(value)
+    painted.measured = value
+    return {
+      width = 96,
+      height = 12,
+    }
+  end
+  function context:fillText(value, x, y)
+    painted.text = value
+    painted.textX = x
+    painted.textY = y
+  end
+  function context:beginPath()
+    painted.beganPath = true
+  end
+  function context:moveTo(x, y)
+    painted.moves[#painted.moves + 1] = {
+      x,
+      y,
+    }
+  end
+  function context:lineTo(x, y)
+    painted.moves[#painted.moves + 1] = {
+      x,
+      y,
+    }
+  end
+  function context:stroke()
+    painted.stroked = true
+  end
+  repository_link.definition.onpaint {
+    context = context,
+  }
+  Test.equal(painted.measured, "View on GitHub")
+  Test.equal(painted.text, "View on GitHub")
+  Test.equal(context.color, "link-text")
+  Test.truthy(painted.beganPath)
+  Test.truthy(painted.stroked)
+
+  repository_link.definition.onmousedown {
+    button = 1,
+    x = 2,
+    y = 2,
+  }
+  repository_link.definition.onmouseup {
+    button = 1,
+    x = 2,
+    y = 2,
+  }
+  Test.equal(#calls.launch, 1)
+  Test.equal(
+    calls.launch[1].path,
+    "https://github.com/soupmasters/AsepriteExtensionManager"
+  )
+
+  repository_link.definition.onmousedown {
+    button = 2,
+    x = 2,
+    y = 2,
+  }
+  repository_link.definition.onmouseup {
+    button = 2,
+    x = 2,
+    y = 2,
+  }
+  repository_link.definition.onmousedown {
+    button = 1,
+    x = 2,
+    y = 2,
+  }
+  repository_link.definition.onmouseup {
+    button = 1,
+    x = 121,
+    y = 2,
+  }
+  Test.equal(#calls.launch, 1)
+  Test.equal(help_dialog.repaintCount, 6)
   Test.truthy(help_dialog.options.resizeable)
   Test.truthy(help_dialog.shown.autoscrollbars)
 
@@ -162,6 +360,60 @@ Test.case("manager uses compact native install and utility controls", function()
     Test.truthy(widget_indices[kind .. "_previous"] < widget_indices[kind .. "_page"])
     Test.truthy(widget_indices[kind .. "_page"] < widget_indices[kind .. "_next"])
   end
+end)
+
+Test.case("persistent manager update arrow dispatches the hidden self update", function()
+  local Dialog, dialogs = Fakes.dialog_factory()
+  local model = Model.new(1)
+  local manager_package = {
+    name = "aseprite-extension-manager",
+    displayName = "Aseprite Extension Manager",
+    version = "0.1.0",
+    isSelf = true,
+    managed = false,
+    update = {
+      kind = "self",
+      version = "0.2.0",
+    },
+  }
+  model:set_installed({
+    manager_package,
+  })
+  local ui = Ui.new({
+    app = Fakes.app {
+      allFilesExist = true,
+    },
+    plugin = Fakes.plugin(),
+    Dialog = Dialog,
+  }, model)
+  local dispatched
+  ui:open {
+    refresh = function() end,
+    install_from_github = function() end,
+    sync_local_folder = function() end,
+    update_package = function(_, package)
+      dispatched = package
+    end,
+    on_dialog_closed = function() end,
+  }
+
+  local manager = dialogs[1]
+  local update_button = manager.widgetsById.manager_update
+  Test.equal(update_button.definition.text, "↑")
+  Test.truthy(update_button.definition.visible)
+  Test.truthy(update_button.definition.enabled)
+  Test.contains(manager.widgetsById.manager_status.definition.text, "v0.2.0 available")
+  update_button.definition.onclick()
+  Test.equal(dispatched, manager_package)
+
+  ui:set_busy(true)
+  Test.truthy(update_button.definition.visible)
+  Test.falsy(update_button.definition.enabled)
+
+  model.busy = false
+  manager_package.update = nil
+  ui:refresh()
+  Test.falsy(update_button.definition.visible)
 end)
 
 Test.case("manager package rows switch between wide and narrow layouts", function()
@@ -594,7 +846,82 @@ Test.case("installed details expose explicit native lifecycle handoffs", functio
   Test.truthy(buttons["Uninstall…"])
 end)
 
-Test.case("manager details expose self-update and recovery even when unmanaged", function()
+Test.case("help keeps hidden manager update and recovery actions available", function()
+  local Dialog, dialogs = Fakes.dialog_factory()
+  local model = Model.new(1)
+  local manager = {
+    name = "aseprite-extension-manager",
+    isSelf = true,
+    displayName = "Aseprite Extension Manager",
+    version = "0.1.0",
+    managed = false,
+    rollbackAvailable = true,
+    update = {
+      kind = "self",
+      version = "0.2.0",
+    },
+    updateError = {
+      code = "network",
+      message = "Could not check the official release.",
+      details = {
+        recoveryArtifact = "/state/self-update/recovery.aseprite-extension",
+      },
+    },
+  }
+  model:set_installed({
+    manager,
+  })
+  Test.equal(#model.installed, 0)
+
+  local ui = Ui.new({
+    app = Fakes.app {
+      allFilesExist = true,
+    },
+    plugin = Fakes.plugin(),
+    Dialog = Dialog,
+  }, model)
+  local updated = 0
+  local restored = 0
+  ui.controller = {
+    update_package = function(_, package)
+      Test.equal(package, manager)
+      updated = updated + 1
+    end,
+    restore_package = function(_, package)
+      Test.equal(package, manager)
+      restored = restored + 1
+    end,
+  }
+  ui:show_help()
+
+  local help = dialogs[1]
+  local buttons = {}
+  local labels = {}
+  for _, widget in ipairs(help.widgets) do
+    if widget.kind == "button" then
+      buttons[widget.definition.text] = widget.definition
+    elseif widget.kind == "label" then
+      labels[widget.definition.label or ""] = widget.definition.text
+    end
+  end
+  Test.truthy(buttons["Update Manager…"])
+  Test.truthy(buttons["Restore Manager…"])
+  Test.falsy(buttons["Enable / Disable…"])
+  Test.falsy(buttons["Uninstall…"])
+  Test.equal(labels["Update:"], "0.2.0")
+  Test.equal(labels["Update check:"], "Could not check the official release.")
+  Test.equal(
+    labels["Recovery package:"],
+    "/state/self-update/recovery.aseprite-extension"
+  )
+
+  buttons["Update Manager…"].onclick()
+  buttons["Restore Manager…"].onclick()
+  Test.equal(updated, 1)
+  Test.equal(restored, 1)
+end)
+
+Test.case("manager details never expose native disable or uninstall handoffs", function()
   local app = Fakes.app {
     allFilesExist = true,
   }
@@ -622,6 +949,7 @@ Test.case("manager details expose self-update and recovery even when unmanaged",
   }
   ui:show_package_details({
     name = "aseprite-extension-manager",
+    isSelf = true,
     displayName = "Aseprite Extension Manager",
     version = "0.1.0",
     managed = false,
@@ -651,6 +979,8 @@ Test.case("manager details expose self-update and recovery even when unmanaged",
   end
   Test.truthy(buttons["Update Manager…"])
   Test.truthy(buttons["Restore Manager…"])
+  Test.falsy(buttons["Enable / Disable…"])
+  Test.falsy(buttons["Uninstall…"])
   local saw_update_error = false
   local saw_recovery = false
   for _, label in ipairs(labels) do

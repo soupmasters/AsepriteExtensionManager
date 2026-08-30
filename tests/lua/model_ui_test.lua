@@ -559,6 +559,27 @@ Test.case("sort and filter controls update browse and installed independently", 
   }) do
     Test.equal(manager.widgetsById[id].kind, "combobox")
     Test.truthy(manager.widgetsById[id].definition.visible)
+    Test.falsy(manager.widgetsById[id].definition.label)
+    Test.falsy(manager.widgetsById[id].definition.hexpand)
+  end
+  Test.falsy(manager.widgetsById.browse_filter_label)
+  Test.falsy(manager.widgetsById.browse_sort_label)
+  Test.falsy(manager.widgetsById.installed_filter_label)
+  Test.falsy(manager.widgetsById.installed_sort_label)
+  local same_row_after = {}
+  for _, call in ipairs(manager.sameRowCalls) do
+    local definition = call.after and call.after.definition
+    if definition and definition.id then
+      same_row_after[definition.id] = true
+    end
+  end
+  for _, kind in ipairs({ "browse", "installed" }) do
+    Test.truthy(same_row_after[kind .. "_search"])
+    Test.truthy(same_row_after[kind .. "_filter"])
+    Test.truthy(manager.widgetsById[kind .. "_stacked_filter"].definition.hexpand)
+    Test.truthy(manager.widgetsById[kind .. "_stacked_sort"].definition.hexpand)
+    Test.falsy(manager.widgetsById[kind .. "_stacked_filter"].definition.label)
+    Test.falsy(manager.widgetsById[kind .. "_stacked_sort"].definition.label)
   end
   Test.equal(manager.widgetsById.browse_filter.definition.option, "All")
   Test.equal(manager.widgetsById.browse_sort.definition.option, "Name A-Z")
@@ -696,6 +717,9 @@ Test.case("manager package rows switch between wide and narrow layouts", functio
     {
       name = "browse-package",
       version = "1.0.0",
+      author = {
+        name = "Package Author",
+      },
     },
   }, "current", false, false)
   model:set_installed({
@@ -726,8 +750,6 @@ Test.case("manager package rows switch between wide and narrow layouts", functio
     Test.falsy(manager.widgetsById[kind .. "_stacked_details_1"].definition.visible)
     Test.truthy(manager.widgetsById[kind .. "_filter"].definition.visible)
     Test.truthy(manager.widgetsById[kind .. "_sort"].definition.visible)
-    Test.truthy(manager.widgetsById[kind .. "_filter_label"].definition.visible)
-    Test.truthy(manager.widgetsById[kind .. "_sort_label"].definition.visible)
     Test.falsy(manager.widgetsById[kind .. "_stacked_filter"].definition.visible)
     Test.falsy(manager.widgetsById[kind .. "_stacked_sort"].definition.visible)
   end
@@ -739,14 +761,15 @@ Test.case("manager package rows switch between wide and narrow layouts", functio
   for _, kind in ipairs({ "browse", "installed" }) do
     Test.falsy(manager.widgetsById[kind .. "_details_1"].definition.visible)
     Test.truthy(manager.widgetsById[kind .. "_stacked_details_1"].definition.visible)
-    Test.falsy(manager.widgetsById[kind .. "_filter"].definition.visible)
-    Test.falsy(manager.widgetsById[kind .. "_sort"].definition.visible)
-    Test.falsy(manager.widgetsById[kind .. "_filter_label"].definition.visible)
-    Test.falsy(manager.widgetsById[kind .. "_sort_label"].definition.visible)
-    Test.truthy(manager.widgetsById[kind .. "_stacked_filter"].definition.visible)
-    Test.truthy(manager.widgetsById[kind .. "_stacked_sort"].definition.visible)
+    Test.truthy(manager.widgetsById[kind .. "_filter"].definition.visible)
+    Test.truthy(manager.widgetsById[kind .. "_sort"].definition.visible)
+    Test.falsy(manager.widgetsById[kind .. "_stacked_filter"].definition.visible)
+    Test.falsy(manager.widgetsById[kind .. "_stacked_sort"].definition.visible)
   end
-  Test.equal(manager.widgetsById.browse_row_1.definition.text, "browse-package  v1.0.0")
+  Test.equal(
+    manager.widgetsById.browse_row_1.definition.text,
+    "browse-package  v1.0.0 · Package Author"
+  )
   Test.equal(
     manager.widgetsById.installed_row_1.definition.text,
     "installed-package  v2.0.0 · ✓"
@@ -766,8 +789,6 @@ Test.case("manager package rows switch between wide and narrow layouts", functio
     Test.falsy(manager.widgetsById[kind .. "_stacked_details_1"].definition.visible)
     Test.truthy(manager.widgetsById[kind .. "_filter"].definition.visible)
     Test.truthy(manager.widgetsById[kind .. "_sort"].definition.visible)
-    Test.truthy(manager.widgetsById[kind .. "_filter_label"].definition.visible)
-    Test.truthy(manager.widgetsById[kind .. "_sort_label"].definition.visible)
     Test.falsy(manager.widgetsById[kind .. "_stacked_filter"].definition.visible)
     Test.falsy(manager.widgetsById[kind .. "_stacked_sort"].definition.visible)
   end
@@ -876,6 +897,10 @@ Test.case("compact pagers remain one native button row without samerow support",
   Test.falsy(manager.widgetsById.browse_stacked_details_1)
   Test.truthy(manager.widgetsById.browse_filter.definition.visible)
   Test.truthy(manager.widgetsById.browse_sort.definition.visible)
+  Test.falsy(manager.widgetsById.browse_filter.definition.label)
+  Test.falsy(manager.widgetsById.browse_sort.definition.label)
+  Test.truthy(manager.widgetsById.browse_filter.definition.hexpand)
+  Test.truthy(manager.widgetsById.browse_sort.definition.hexpand)
   Test.falsy(manager.widgetsById.browse_stacked_filter)
   Test.falsy(manager.widgetsById.browse_stacked_sort)
 end)
@@ -1073,7 +1098,7 @@ Test.case("catalog author objects render by name", function()
   Test.falsy(row:find("table:", 1, true))
 end)
 
-Test.case("catalog manifest names are searchable and shown in details", function()
+Test.case("catalog identities are searchable and manifest names appear in details", function()
   local app = Fakes.app {
     allFilesExist = true,
   }
@@ -1085,10 +1110,14 @@ Test.case("catalog manifest names are searchable and shown in details", function
       manifestName = "Example-Tools",
       displayName = "Example Tools",
       version = "1.0.0",
+      repository = "https://github.com/example/UnityEventForAseprite",
     },
   }, "current", false, false)
   model:set_search("browse", "example-tools")
   local matches = model:filtered("browse")
+  Test.equal(#matches, 1)
+  model:set_search("browse", "unityeventforaseprite")
+  matches = model:filtered("browse")
   Test.equal(#matches, 1)
 
   local ui = Ui.new({

@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "generatedAt": "2026-08-30T00:19:48Z",
+  "generatedAt": "2026-08-30T06:59:15Z",
   "packages": [
     {
       "id": "attachment-system",
@@ -36,7 +36,7 @@
     {
       "id": "unity-animation-event",
       "manifestName": "unity-animation-event",
-      "displayName": "Unity Animation Event",
+      "displayName": "Unity Event for Aseprite",
       "summary": "Author Unity animation events directly in Aseprite's timeline.",
       "author": {
         "name": "Martin Calander",

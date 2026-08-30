@@ -75,8 +75,11 @@ local function package_text(package)
     package.manifestName or "",
     package.id or "",
     package.displayName or "",
+    package.summary or "",
     author or "",
     package.license or "",
+    package.homepage or "",
+    package.repository or "",
     source or "",
   }, " "):lower()
 end

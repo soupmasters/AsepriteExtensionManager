@@ -198,7 +198,11 @@ local function installed_row(package)
 end
 
 local function narrow_catalog_row(package)
-  return package_title(package) .. "  v" .. package_version(package)
+  local row = package_title(package) .. "  v" .. package_version(package)
+  if package.author then
+    row = row .. " · " .. author_name(package.author)
+  end
+  return row
 end
 
 local function narrow_installed_row(package)
@@ -264,15 +268,14 @@ end
 local function add_view_controls(ui, dialog, kind, supports_same_row)
   local options = VIEW_OPTIONS[kind]
 
-  local function add_combobox(field, id, visible, label)
+  local function add_combobox(field, id, visible, expand)
     local choices = options[field]
     dialog:combobox {
       id = id,
-      label = label,
       options = option_labels(choices),
       option = option_label(choices, view_value(ui.model, kind, field)),
       visible = visible,
-      hexpand = true,
+      hexpand = expand == true,
       onchange = function()
         local selected = option_value(choices, dialog.data[id])
         local changed
@@ -289,31 +292,20 @@ local function add_view_controls(ui, dialog, kind, supports_same_row)
   end
 
   if supports_same_row then
-    dialog:label {
-      id = kind .. "_filter_label",
-      text = "Filter:",
-      hexpand = false,
-    }
     dialog:samerow()
-    add_combobox("filter", kind .. "_filter", true)
+    add_combobox("filter", kind .. "_filter", true, false)
     dialog:samerow()
-    dialog:label {
-      id = kind .. "_sort_label",
-      text = "Sort:",
-      hexpand = false,
-    }
-    dialog:samerow()
-    add_combobox("sort", kind .. "_sort", true)
+    add_combobox("sort", kind .. "_sort", true, false)
   else
-    add_combobox("filter", kind .. "_filter", true, "Filter:")
-    add_combobox("sort", kind .. "_sort", true, "Sort:")
+    add_combobox("filter", kind .. "_filter", true, true)
+    add_combobox("sort", kind .. "_sort", true, true)
   end
   dialog:newrow()
 
   if supports_same_row then
-    add_combobox("filter", kind .. "_stacked_filter", false, "Filter:")
+    add_combobox("filter", kind .. "_stacked_filter", false, true)
     dialog:newrow()
-    add_combobox("sort", kind .. "_stacked_sort", false, "Sort:")
+    add_combobox("sort", kind .. "_stacked_sort", false, true)
     dialog:newrow()
   end
 end
@@ -555,30 +547,19 @@ function Ui:_update_view_controls(kind)
   if not dialog then
     return
   end
-  local stacked = self.supportsSameRow and self.rowsStacked
   local options = VIEW_OPTIONS[kind]
-  if self.supportsSameRow then
-    dialog:modify {
-      id = kind .. "_filter_label",
-      visible = not stacked,
-    }
-    dialog:modify {
-      id = kind .. "_sort_label",
-      visible = not stacked,
-    }
-  end
   for _, field in ipairs({ "filter", "sort" }) do
     local selected = option_label(options[field], view_value(self.model, kind, field))
     dialog:modify {
       id = kind .. "_" .. field,
       option = selected,
-      visible = not stacked,
+      visible = true,
     }
     if self.supportsSameRow then
       dialog:modify {
         id = kind .. "_stacked_" .. field,
         option = selected,
-        visible = stacked,
+        visible = false,
       }
     end
   end

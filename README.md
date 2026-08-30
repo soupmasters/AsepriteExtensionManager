@@ -1,4 +1,6 @@
-<img src="assets/aseprite-extension-manager-logo.svg" alt="Aseprite Extension Manager logo" width="180">
+<p align="center">
+  <img src="assets/aseprite-extension-manager-banner.png" alt="Aseprite Extension Manager">
+</p>
 
 # Aseprite Extension Manager
 

@@ -83,16 +83,21 @@ profile for destructive failure simulations.
 12. Make one linked source unavailable and make another fail validation.
     Confirm each package displays its update error, other update checks still
     complete, and neither failure is presented as "up to date."
-13. Confirm enable and disable open native Extensions preferences. Uninstall a
-    managed extension and a manually copied extension without `__info.json`.
-    Confirm each disappears from the manager, its exact folder is moved to
-    recovery storage, a uniquely matching receipt is archived, its source
-    folder is untouched, and Aseprite requests an immediate restart. Before
-    restarting, confirm further install, update, restore, and uninstall actions
-    are blocked. Repeat once while closing the manager before the helper replies,
-    then reopen it and confirm the restart lock remains. Confirm uninstall cannot
-    start during a refresh. Confirm the manager itself has no uninstall action
-    and the helper rejects a direct manager uninstall request.
+13. Confirm enable and disable open native Extensions preferences. Without
+    restarting between them, uninstall a managed extension and a manually copied
+    extension without `__info.json`. Confirm each disappears from the manager,
+    its exact folder is moved to a separate recovery location, a uniquely
+    matching receipt is archived, its source folder is untouched, and Aseprite
+    requests one restart after the removals. Before restarting, confirm further
+    uninstall actions remain available only after the preceding helper request
+    succeeds, while install, update, restore, refresh, cache, and extension
+    settings actions stay blocked. Repeat once while closing the manager before
+    the helper replies, then reopen it and confirm every management action,
+    including another uninstall, remains locked. Confirm a definite rejection
+    of a later uninstall preserves the restart requirement from earlier
+    removals. Confirm uninstall cannot start during a refresh. Confirm the
+    manager itself has no uninstall action and the helper rejects a direct
+    manager uninstall request.
 14. Trigger one managed update and verify the startup check runs no more than
     once in 24 hours. Confirm an update uses an eight-second status tip while
     success and transient network failure remain silent.

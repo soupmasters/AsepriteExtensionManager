@@ -388,6 +388,62 @@ mod tests {
     }
 
     #[test]
+    fn uninstall_quarantines_two_distinct_extensions_sequentially() {
+        let temporary = tempfile::tempdir().expect("tempdir");
+        let extensions = temporary.path().join("extensions");
+        let manager = extensions.join("manager");
+        let first = extensions.join("first");
+        let second = extensions.join("second");
+        for directory in [&manager, &first, &second] {
+            fs::create_dir_all(directory).expect("mkdir");
+        }
+        fs::write(
+            first.join("package.json"),
+            br#"{"name":"first","version":"1.0.0"}"#,
+        )
+        .expect("first manifest");
+        fs::write(
+            second.join("package.json"),
+            br#"{"name":"second","version":"2.0.0"}"#,
+        )
+        .expect("second manifest");
+        let state = State::new(temporary.path()).expect("state");
+        state
+            .write_receipt(&receipt("first", "1.0.0"))
+            .expect("first receipt");
+        state
+            .write_receipt(&receipt("second", "2.0.0"))
+            .expect("second receipt");
+
+        let first_result = uninstall(temporary.path(), &state, &manager, "first", "1.0.0", &first)
+            .expect("uninstall first");
+        let second_result = uninstall(
+            temporary.path(),
+            &state,
+            &manager,
+            "second",
+            "2.0.0",
+            &second,
+        )
+        .expect("uninstall second");
+
+        assert!(!first.exists());
+        assert!(!second.exists());
+        assert_ne!(first_result.recovery_path, second_result.recovery_path);
+        assert!(first_result.recovery_path.join("package.json").is_file());
+        assert!(second_result.recovery_path.join("package.json").is_file());
+        assert!(state
+            .read_receipt("first")
+            .expect("read first receipt")
+            .is_none());
+        assert!(state
+            .read_receipt("second")
+            .expect("read second receipt")
+            .is_none());
+        assert!(scan(temporary.path(), &state).expect("rescan").is_empty());
+    }
+
+    #[test]
     fn uninstall_preserves_a_stale_receipt() {
         let temporary = tempfile::tempdir().expect("tempdir");
         let extensions = temporary.path().join("extensions");

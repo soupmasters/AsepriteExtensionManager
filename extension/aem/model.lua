@@ -265,7 +265,15 @@ function Model:set_search(kind, value)
     return true
   elseif kind == "github" then
     self.githubSearch = value or ""
+    self.githubRepositories = {}
     self.githubPage = 1
+    self.githubPageCount = 1
+    self.githubTotal = 0
+    self.githubHasNextPage = false
+    self.githubEndCursor = nil
+    self.githubLoading = false
+    self.githubLoaded = false
+    self.githubError = nil
     return true
   end
   return false

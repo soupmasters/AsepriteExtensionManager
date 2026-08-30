@@ -130,11 +130,15 @@ manager-owned recovery storage. Only a uniquely matching receipt is archived
 and removed, and a transaction record reconciles interrupted receipt cleanup
 on the next helper start. No extension files are deleted. Loaded commands can
 remain registered after the move, but resource access and shutdown hooks can
-fail because the original folder is gone. The manager therefore blocks further
-extension changes and requires an immediate Aseprite restart. The lock begins
-when the request is dispatched and survives a closed dialog or lost helper
-connection. It is cleared without a restart only when the helper explicitly
-rejects the request before moving the folder.
+fail because the original folder is gone. The manager therefore enters an
+uninstall-only state and requires an Aseprite restart after the removal batch.
+Install, update, restore, refresh, cache, and extension settings actions remain
+blocked. Another uninstall is allowed only after the helper confirms the
+previous exact move and recovery transaction. A pending, cancelled, or
+uncertain request blocks every further extension change because the folder may
+already have moved. A definite helper rejection restores the state that existed
+before that request, so it does not erase the restart requirement from an
+earlier confirmed removal.
 
 Managed receipts are committed only after the installed manifest matches the
 expected name and version. The cache retains current and previous exact

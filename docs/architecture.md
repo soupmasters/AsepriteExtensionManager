@@ -58,16 +58,18 @@ After Aseprite's prompt closes, the manager rescans the installed manifest. A
 receipt is written only when the expected package name and version are present.
 Enable and disable actions open Aseprite's native Extensions preferences.
 Uninstall is restart-bound because Aseprite exposes no scripting command for
-unloading an extension. After confirmation, the helper revalidates the exact
-scanned folder, refuses the manager itself, and atomically moves that folder to
-manager-owned recovery storage. A matching receipt is archived and removed
-through the same journaled transaction, with cleanup reconciled on the next
-helper start if it was interrupted. The manager removes the entry from its
-current view and blocks further extension changes for the rest of the session.
-Aseprite must be restarted immediately because loaded commands can remain
-registered while file and resource access can already fail. The restart lock is
-set when the uninstall request is sent. A definite helper rejection clears it,
-but an interrupted request keeps it because the move may already have finished.
+unloading an extension. The helper revalidates the exact scanned folder,
+refuses the manager itself, and atomically moves that folder to manager-owned
+recovery storage. A matching receipt is archived and removed through the same
+journaled transaction, with cleanup reconciled on the next helper start if it
+was interrupted. The manager removes the entry from its current view and enters
+an uninstall-only state. More removals may be requested sequentially, but only
+after the helper confirms each preceding recovery transaction. All other
+extension management remains blocked until Aseprite restarts because loaded
+commands can remain registered while file and resource access can already fail.
+A pending, cancelled, or uncertain uninstall blocks even further removals
+because the move may already have finished. A definite helper rejection
+restores the state from before that request.
 
 A manager update is the one exception to same-session verification. Before
 Aseprite installs it, the extension shuts down the helper so the helper binary

@@ -1276,14 +1276,18 @@ function Controller:uninstall_package(package)
   end
 
   local display_name = tostring(package.displayName or name)
-  local message = "Uninstall "
-    .. display_name
-    .. "?\n\nIts files will be moved out of Aseprite and kept as a recovery copy. "
-    .. "Restart Aseprite immediately afterward. Until then, the extension may remain "
-    .. "partly active or stop working."
+  local message_lines = {
+    "Uninstall " .. display_name .. "?",
+    "",
+    "Its files will be moved out of Aseprite and kept as a recovery copy.",
+    "Restart Aseprite immediately afterward.",
+    "Until then, the extension may remain partly active or stop working.",
+  }
   if type(package.source) == "table" and package.source.kind == "local" then
-    message = message .. " Your linked source folder will not be changed."
+    message_lines[#message_lines + 1] = ""
+    message_lines[#message_lines + 1] = "Your linked source folder will not be changed."
   end
+  local message = table.concat(message_lines, "\n")
   if not self.ui:confirm("Uninstall Extension", message, "Uninstall") then
     return false
   end

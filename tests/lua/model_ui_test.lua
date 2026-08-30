@@ -503,6 +503,7 @@ Test.case("manager uses compact native install and utility controls", function()
       local row = manager.widgetsById[row_id]
       local details = manager.widgetsById[details_id]
       Test.equal(row.kind, "label")
+      Test.falsy(row.definition.hexpand)
       Test.equal(details.kind, "button")
       Test.equal(details.definition.text, "Details")
       Test.falsy(details.definition.hexpand)
@@ -533,6 +534,17 @@ Test.case("manager uses compact native install and utility controls", function()
     Test.falsy(next_page.enabled)
     Test.truthy(widget_indices[kind .. "_previous"] < widget_indices[kind .. "_page"])
     Test.truthy(widget_indices[kind .. "_page"] < widget_indices[kind .. "_next"])
+    local pager_end = widget_indices[kind .. "_pager_right_spacer"]
+      or widget_indices[kind .. "_next"]
+    Test.equal(manager.widgets[pager_end + 1].kind, "newrow")
+    local next_widget = manager.widgets[pager_end + 2]
+    if kind == "browse" then
+      Test.equal(next_widget.kind, "tab")
+      Test.equal(next_widget.definition.id, "installed_tab")
+    else
+      Test.equal(next_widget.kind, "endtabs")
+      Test.equal(next_widget.definition.id, "manager_tabs")
+    end
   end
 end)
 
@@ -1182,6 +1194,58 @@ Test.case("compact pagers remain one native button row without samerow support",
     manager.widgetsById.installed_details_1.definition.label,
     "installed-two  v1.0.0"
   )
+end)
+
+Test.case("confirmation dialogs use readable wrapped rows and bounded width", function()
+  local function open_confirmation(window_width)
+    local Dialog, dialogs = Fakes.dialog_factory()
+    local ui = Ui.new({
+      app = Fakes.app {
+        allFilesExist = true,
+        windowWidth = window_width,
+      },
+      plugin = Fakes.plugin(),
+      Dialog = Dialog,
+    }, Model.new(1))
+    ui:confirm(
+      "Uninstall Extension",
+      table.concat({
+        "Uninstall Example Extension?",
+        "",
+        "Its files will be moved out of Aseprite and kept as a recovery copy. "
+          .. "Restart Aseprite immediately afterward. Until then, the extension "
+          .. "may remain partly active or stop working.",
+        string.rep("x", 80),
+      }, "\n"),
+      "Uninstall",
+      "Keep Extension"
+    )
+    return dialogs[1]
+  end
+
+  local dialog = open_confirmation(1280)
+  local message_rows = {}
+  for index = 1, 20 do
+    local widget = dialog.widgetsById["confirm_message_" .. tostring(index)]
+    if not widget then
+      break
+    end
+    message_rows[#message_rows + 1] = widget.definition.text
+  end
+  Test.truthy(#message_rows >= 7)
+  for _, line in ipairs(message_rows) do
+    Test.falsy(line:find("\n", 1, true))
+    Test.truthy(#line <= 64)
+  end
+  Test.equal(dialog.widgetsById.confirm_action.definition.text, "Uninstall")
+  Test.equal(dialog.widgetsById.cancel_action.definition.text, "Keep Extension")
+  Test.truthy(dialog.shown.autoscrollbars)
+  Test.truthy(dialog.shown.bounds)
+  Test.truthy(dialog.shown.bounds.width >= 560)
+  Test.truthy(dialog.shown.bounds.width <= 1248)
+
+  local narrow = open_confirmation(500)
+  Test.equal(narrow.shown.bounds.width, 468)
 end)
 
 Test.case("secondary windows are resizable and scroll when space is constrained", function()

@@ -12,6 +12,8 @@ local LEFT_MOUSE_BUTTON = MouseButton and MouseButton.LEFT or 1
 local POINTER_CURSOR = MouseCursor and MouseCursor.POINTER or nil
 local RESIZE_DEBOUNCE_SECONDS = 0.1
 local DEFAULT_MANAGER_WIDTH = 720
+local DEFAULT_CONFIRM_WIDTH = 560
+local CONFIRM_LINE_COLUMNS = 64
 local MANAGER_WINDOW_MARGIN = 16
 local FALLBACK_INLINE_WIDTH = 560
 local WIDTH_PRESERVING_AUTOFIT = Align and Align.TOP or 0
@@ -281,6 +283,129 @@ local function ui_scale(app_instance)
   return math.max(1, tonumber(app_instance and app_instance.uiScale) or 1)
 end
 
+local function utf8_length(value)
+  if utf8 and type(utf8.len) == "function" then
+    local ok, length = pcall(utf8.len, value)
+    if ok and length then
+      return length
+    end
+  end
+  return #value
+end
+
+local function utf8_prefix(value, length)
+  if utf8 and type(utf8.offset) == "function" then
+    local ok, offset = pcall(utf8.offset, value, length + 1)
+    if ok then
+      if not offset then
+        return value, ""
+      end
+      return value:sub(1, offset - 1), value:sub(offset)
+    end
+  end
+  return value:sub(1, length), value:sub(length + 1)
+end
+
+local function wrapped_text_lines(value, columns)
+  columns = math.max(1, tonumber(columns) or CONFIRM_LINE_COLUMNS)
+  local normalized = tostring(value or "")
+    :gsub("\r\n", "\n")
+    :gsub("\r", "\n")
+  local lines = {}
+
+  local function append_paragraph(paragraph)
+    if paragraph:match("^%s*$") then
+      lines[#lines + 1] = ""
+      return
+    end
+
+    local current = ""
+    for original_word in paragraph:gmatch("%S+") do
+      local word = original_word
+      while utf8_length(word) > columns do
+        if current ~= "" then
+          lines[#lines + 1] = current
+          current = ""
+        end
+        local prefix
+        prefix, word = utf8_prefix(word, columns)
+        lines[#lines + 1] = prefix
+      end
+
+      if current == "" then
+        current = word
+      elseif utf8_length(current) + 1 + utf8_length(word) <= columns then
+        current = current .. " " .. word
+      else
+        lines[#lines + 1] = current
+        current = word
+      end
+    end
+    if current ~= "" then
+      lines[#lines + 1] = current
+    end
+  end
+
+  for paragraph in (normalized .. "\n"):gmatch("(.-)\n") do
+    append_paragraph(paragraph)
+  end
+  if #lines == 0 then
+    lines[1] = ""
+  end
+  return lines
+end
+
+local function add_wrapped_labels(dialog, id_prefix, value, columns)
+  local lines = wrapped_text_lines(value, columns)
+  for index, line in ipairs(lines) do
+    dialog:label {
+      id = id_prefix .. tostring(index),
+      text = line == "" and " " or line,
+      hexpand = true,
+    }
+  end
+  return lines
+end
+
+local function confirmation_show_bounds(dialog, app_instance, rectangle_constructor)
+  local current_width = dialog_dimension(dialog, "sizeHint", "width")
+    or dialog_dimension(dialog, "bounds", "width")
+  local current_height = dialog_dimension(dialog, "sizeHint", "height")
+    or dialog_dimension(dialog, "bounds", "height")
+  if not current_width or not current_height then
+    return nil
+  end
+
+  local window = app_instance and app_instance.window
+  local window_width = object_dimension(window, "width")
+  local window_height = object_dimension(window, "height")
+  local scale = ui_scale(app_instance)
+  local margin = MANAGER_WINDOW_MARGIN * scale
+  local target_width = math.max(current_width, DEFAULT_CONFIRM_WIDTH * scale)
+  local target_height = current_height
+  if window_width then
+    target_width = math.min(target_width, math.max(1, window_width - margin * 2))
+  end
+  if window_height then
+    target_height = math.min(target_height, math.max(1, window_height - margin * 2))
+  end
+
+  local target_x = window_width and math.floor((window_width - target_width) / 2) or 0
+  local target_y = window_height and math.floor((window_height - target_height) / 2) or 0
+  target_x = math.max(window_width and margin or 0, target_x)
+  target_y = math.max(window_height and margin or 0, target_y)
+
+  if type(rectangle_constructor) == "function" then
+    return rectangle_constructor(target_x, target_y, target_width, target_height)
+  end
+  return {
+    x = target_x,
+    y = target_y,
+    width = target_width,
+    height = target_height,
+  }
+end
+
 local function manager_show_bounds(dialog, app_instance, rectangle_constructor)
   local current_width = dialog_dimension(dialog, "bounds", "width")
     or dialog_dimension(dialog, "sizeHint", "width")
@@ -507,6 +632,7 @@ local function add_pager(ui, dialog, kind, supports_same_row)
       visible = active,
     }
   end
+  dialog:newrow()
 end
 
 local function update_pager(
@@ -927,7 +1053,7 @@ function Ui:_build()
         id = "browse_row_" .. tostring(index),
         text = "",
         visible = false,
-        hexpand = true,
+        hexpand = false,
       }
       dialog:samerow()
     end
@@ -981,7 +1107,7 @@ function Ui:_build()
         id = "installed_row_" .. tostring(index),
         text = "",
         visible = false,
-        hexpand = true,
+        hexpand = false,
       }
       dialog:samerow()
     end
@@ -1335,10 +1461,7 @@ function Ui:confirm(title, message, confirm_text, cancel_text)
     parent = self:_parent(),
     resizeable = true,
   }
-  dialog:label {
-    text = message,
-    hexpand = true,
-  }
+  add_wrapped_labels(dialog, "confirm_message_", message, CONFIRM_LINE_COLUMNS)
   dialog:button {
     id = "confirm_action",
     text = confirm_text or "Continue",
@@ -1348,7 +1471,16 @@ function Ui:confirm(title, message, confirm_text, cancel_text)
     id = "cancel_action",
     text = cancel_text or "Cancel",
   }
-  show_responsive(dialog)
+  local show_options = {}
+  local bounds = confirmation_show_bounds(
+    dialog,
+    self.app,
+    self.environment.Rectangle
+  )
+  if bounds then
+    show_options.bounds = bounds
+  end
+  show_responsive(dialog, show_options)
   return dialog.data.confirm_action == true
 end
 

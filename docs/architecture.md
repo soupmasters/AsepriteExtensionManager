@@ -41,8 +41,8 @@ application-location discovery is required at runtime.
 6. The helper exits after `shutdown`, when the client disconnects, or after its
    idle timeout.
 
-The helper prepares and validates artifacts, but it does not change loaded
-extensions directly. Lua gives a prepared absolute path to:
+The helper prepares and validates installation artifacts. Lua gives a prepared
+absolute path to:
 
 ```lua
 app.command.Options { installExtension = absolutePath }
@@ -50,8 +50,18 @@ app.command.Options { installExtension = absolutePath }
 
 After Aseprite's prompt closes, the manager rescans the installed manifest. A
 receipt is written only when the expected package name and version are present.
-Enable, disable, and uninstall actions open Aseprite's native Extensions
-preferences and rescan after the user returns.
+Enable and disable actions open Aseprite's native Extensions preferences.
+Uninstall is restart-bound because Aseprite exposes no scripting command for
+unloading an extension. After confirmation, the helper revalidates the exact
+scanned folder, refuses the manager itself, and atomically moves that folder to
+manager-owned recovery storage. A matching receipt is archived and removed
+through the same journaled transaction, with cleanup reconciled on the next
+helper start if it was interrupted. The manager removes the entry from its
+current view and blocks further extension changes for the rest of the session.
+Aseprite must be restarted immediately because loaded commands can remain
+registered while file and resource access can already fail. The restart lock is
+set when the uninstall request is sent. A definite helper rejection clears it,
+but an interrupted request keeps it because the move may already have finished.
 
 A manager update is the one exception to same-session verification. Before
 Aseprite installs it, the extension shuts down the helper so the helper binary
@@ -64,7 +74,7 @@ remain cached for the lifetime of the process.
 
 Package preparation is separate from installation:
 
-1. Resolve a catalog, public GitHub, or local-folder source to immutable input.
+1. Resolve a catalog, GitHub, or local-folder source to immutable input.
 2. Download or snapshot into staging.
 3. Validate archive paths, entry types, manifest identity, contribution paths,
    size limits, and unsupported native content.
@@ -94,6 +104,12 @@ resolved commit. Update checks resolve that saved source again. A newer release
 version is an update; a tracked repository snapshot is also an update when its
 artifact changes without a version change. Downgrades and identical artifacts
 are ignored.
+
+Public GitHub sources use the helper's restricted HTTPS client. A source that
+is not publicly visible can be retried through a signed-in GitHub CLI using
+`gh api`. This is a transport choice only. Private downloads retain the same
+canonical source identity and pass through the same validation and receipt
+flow, so later update checks work without persisting credentials.
 
 Failure to resolve, read, or validate one linked source is attached to that
 installed package as `updateError` and returned in the top-level `updateErrors`

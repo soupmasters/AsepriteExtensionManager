@@ -15,7 +15,10 @@ use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, 
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{accept_hdr_async, WebSocketStream};
 
-use crate::github::{GitHubClient, ManagerRelease, ResolveOptions, ResolveResult};
+use crate::github::{
+    parse_github_url, GitHubClient, GitHubSource, GitHubTarget, ManagerRelease, ResolveOptions,
+    ResolveResult,
+};
 use crate::installed;
 use crate::package::{self, ExpectedManifest, PreparedPackage};
 use crate::protocol::{
@@ -24,6 +27,7 @@ use crate::protocol::{
 };
 use crate::registry::{available_updates, release_supports, RegistryClient, RegistryView};
 use crate::state::{PendingSelfUpdate, Receipt, State};
+use crate::tooling;
 use crate::{PROTOCOL_VERSION, VERSION};
 
 const MAX_RPC_MESSAGE_BYTES: usize = 1024 * 1024;
@@ -310,6 +314,18 @@ async fn handle_request(context: Arc<Context>, method: Method, params: Value) ->
             )?;
             Ok(serde_json::json!({ "packages": packages }))
         }
+        Method::UninstallPackage => {
+            let params: UninstallPackageParams = decode_params(params)?;
+            let result = installed::uninstall(
+                &context.user_config,
+                &context.state,
+                &context.extension_root,
+                &params.name,
+                &params.version,
+                &params.path,
+            )?;
+            serde_json::to_value(result).map_err(|error| RpcError::internal(error.to_string()))
+        }
         Method::RefreshRegistry => {
             let _: EmptyParams = decode_params(params)?;
             let view = context.registry.refresh(Utc::now())?;
@@ -376,7 +392,11 @@ async fn handle_request(context: Arc<Context>, method: Method, params: Value) ->
                                 })
                                 .await?
                             {
-                                ResolveResult::Ready { package, source } => {
+                                ResolveResult::Ready {
+                                    package,
+                                    source: resolved_source,
+                                } => {
+                                    ensure_managed_github_source_kind(source, &resolved_source)?;
                                     if let Some(version) = params.version.as_deref() {
                                         if package.version != version {
                                             return Err(RpcError::invalid(
@@ -386,8 +406,11 @@ async fn handle_request(context: Arc<Context>, method: Method, params: Value) ->
                                         }
                                     }
                                     reject_self_update(&package)?;
-                                    serde_json::to_value(ResolveResult::Ready { package, source })
-                                        .map_err(|error| RpcError::internal(error.to_string()))
+                                    serde_json::to_value(ResolveResult::Ready {
+                                        package,
+                                        source: resolved_source,
+                                    })
+                                    .map_err(|error| RpcError::internal(error.to_string()))
                                 }
                                 ResolveResult::SelectionRequired { .. } => Err(RpcError::invalid(
                                     "ASSET_SELECTION_REQUIRED",
@@ -727,6 +750,7 @@ async fn handle_request(context: Arc<Context>, method: Method, params: Value) ->
                     })(),
                     "github-release" | "github-snapshot" => {
                         async {
+                            ensure_stored_source_kind(&receipt.source_kind, &receipt.source)?;
                             let url = managed_github_resolution_url(&receipt.source)?;
                             match context
                                 .github
@@ -736,7 +760,14 @@ async fn handle_request(context: Arc<Context>, method: Method, params: Value) ->
                                 })
                                 .await?
                             {
-                                ResolveResult::Ready { package, source } => {
+                                ResolveResult::Ready {
+                                    package,
+                                    source: resolved_source,
+                                } => {
+                                    ensure_managed_github_source_kind(
+                                        &receipt.source,
+                                        &resolved_source,
+                                    )?;
                                     ensure_candidate_identity(receipt, &package)?;
                                     if github_candidate_is_update(receipt, &package) {
                                         let resolution = serde_json::json!({
@@ -747,7 +778,7 @@ async fn handle_request(context: Arc<Context>, method: Method, params: Value) ->
                                             "version": package.version,
                                             "sha256": package.sha256,
                                             "byteLength": package.byte_length,
-                                            "source": source
+                                            "source": resolved_source
                                         });
                                         Ok(Some(serde_json::json!({
                                             "kind": "github",
@@ -912,7 +943,23 @@ async fn handle_request(context: Arc<Context>, method: Method, params: Value) ->
         }
         Method::Diagnostics => {
             let _: EmptyParams = decode_params(params)?;
-            let installed_count = installed::scan(&context.user_config, &context.state)?.len();
+            let user_config = context.user_config.clone();
+            let state = context.state.clone();
+            let installed_scan = tokio::task::spawn_blocking(move || {
+                installed::scan(&user_config, &state).map(|packages| packages.len())
+            });
+            let (tool_status, installed_scan) = tokio::join!(
+                tooling::diagnostics(),
+                tokio::time::timeout(Duration::from_secs(2), installed_scan)
+            );
+            let installed_count = match installed_scan {
+                Ok(Ok(Ok(count))) => u64::try_from(count)
+                    .ok()
+                    .map_or(Value::Null, |count| Value::Number(count.into())),
+                _ => Value::Null,
+            };
+            let tools = serde_json::to_value(tool_status)
+                .map_err(|error| RpcError::internal(error.to_string()))?;
             Ok(diagnostic_map([
                 ("version".to_owned(), Value::String(VERSION.to_owned())),
                 (
@@ -927,14 +974,12 @@ async fn handle_request(context: Arc<Context>, method: Method, params: Value) ->
                     "architecture".to_owned(),
                     Value::String(std::env::consts::ARCH.to_owned()),
                 ),
-                (
-                    "installedCount".to_owned(),
-                    Value::Number(installed_count.into()),
-                ),
+                ("installedCount".to_owned(), installed_count),
                 (
                     "registryBundled".to_owned(),
                     Value::Bool(context.extension_root.join("registry/root.json").is_file()),
                 ),
+                ("tools".to_owned(), tools),
                 ("telemetry".to_owned(), Value::Bool(false)),
             ]))
         }
@@ -1410,6 +1455,18 @@ fn github_asset_selection(source: &Value) -> Option<String> {
 }
 
 fn managed_github_resolution_url(source: &Value) -> RpcResult<String> {
+    let source_kind = source.get("kind").and_then(Value::as_str);
+    if source_kind == Some("github-release")
+        && source
+            .get("assetName")
+            .and_then(Value::as_str)
+            .is_none_or(str::is_empty)
+    {
+        return Err(RpcError::invalid(
+            "INVALID_MANAGED_SOURCE",
+            "managed GitHub release is missing its saved asset name",
+        ));
+    }
     let repository = source
         .get("repository")
         .or_else(|| source.get("immutableUrl"))
@@ -1420,7 +1477,19 @@ fn managed_github_resolution_url(source: &Value) -> RpcResult<String> {
                 "GitHub source is missing its repository",
             )
         })?;
-    if source.get("kind").and_then(Value::as_str) != Some("github-snapshot") {
+    if !matches!(
+        parse_github_url(repository)?,
+        GitHubTarget::Repository {
+            requested_ref: None,
+            ..
+        }
+    ) {
+        return Err(RpcError::invalid(
+            "INVALID_MANAGED_SOURCE",
+            "managed GitHub source must retain its root repository URL",
+        ));
+    }
+    if source_kind != Some("github-snapshot") {
         return Ok(repository.to_owned());
     }
     let tracked_ref = source
@@ -1457,6 +1526,35 @@ fn managed_github_resolution_url(source: &Value) -> RpcResult<String> {
         }
     }
     Ok(url.to_string())
+}
+
+fn ensure_managed_github_source_kind(expected: &Value, resolved: &GitHubSource) -> RpcResult<()> {
+    let expected_kind = expected
+        .get("kind")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            RpcError::invalid(
+                "INVALID_MANAGED_SOURCE",
+                "managed GitHub source is missing its kind",
+            )
+        })?;
+    if resolved.kind != expected_kind {
+        return Err(RpcError::invalid(
+            "GITHUB_SOURCE_LINEAGE_CHANGED",
+            "managed GitHub source changed kind while resolving an update",
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_stored_source_kind(expected_kind: &str, source: &Value) -> RpcResult<()> {
+    if source.get("kind").and_then(Value::as_str) != Some(expected_kind) {
+        return Err(RpcError::invalid(
+            "INVALID_MANAGED_SOURCE",
+            "managed source kind does not match its receipt",
+        ));
+    }
+    Ok(())
 }
 
 fn ensure_candidate_identity(receipt: &Receipt, candidate: &PreparedPackage) -> RpcResult<()> {
@@ -1540,6 +1638,14 @@ struct VerifyInstallParams {
     version: String,
     artifact_path: PathBuf,
     source: Value,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct UninstallPackageParams {
+    name: String,
+    version: String,
+    path: PathBuf,
 }
 
 #[derive(Deserialize)]
@@ -1738,6 +1844,49 @@ mod tests {
             github_asset_selection(&source).as_deref(),
             Some("sample-windows.aseprite-extension")
         );
+        assert_eq!(
+            managed_github_resolution_url(&source).unwrap(),
+            "https://github.com/example/sample"
+        );
+
+        let legacy = serde_json::json!({
+            "kind": "github-release",
+            "repository": "https://github.com/example/sample"
+        });
+        let error = managed_github_resolution_url(&legacy)
+            .expect_err("a saved release must retain its selected asset");
+        assert_eq!(error.code, "INVALID_MANAGED_SOURCE");
+
+        let corrupt = serde_json::json!({
+            "kind": "github-release",
+            "repository": "https://github.com/example/sample/tree/main",
+            "assetName": "sample.aseprite-extension"
+        });
+        let error = managed_github_resolution_url(&corrupt)
+            .expect_err("a saved release cannot point to a branch URL");
+        assert_eq!(error.code, "INVALID_MANAGED_SOURCE");
+
+        let resolved = GitHubSource {
+            kind: "github-snapshot".to_owned(),
+            repository: "https://github.com/example/sample".to_owned(),
+            immutable_url: "https://codeload.github.com/example/sample/zip/commit".to_owned(),
+            release: None,
+            asset_id: None,
+            asset_name: None,
+            commit: Some("1".repeat(40)),
+            tracked_ref: Some("main".to_owned()),
+        };
+        let error = ensure_managed_github_source_kind(&source, &resolved)
+            .expect_err("a managed release cannot become a snapshot");
+        assert_eq!(error.code, "GITHUB_SOURCE_LINEAGE_CHANGED");
+        let error = ensure_stored_source_kind(
+            "github-release",
+            &serde_json::json!({
+                "kind": "github-snapshot"
+            }),
+        )
+        .expect_err("receipt and inner source kinds must agree");
+        assert_eq!(error.code, "INVALID_MANAGED_SOURCE");
     }
 
     #[test]

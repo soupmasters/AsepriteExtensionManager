@@ -5,6 +5,7 @@ Protocol.VERSION = 1
 Protocol.METHODS = {
   ping = true,
   scanInstalled = true,
+  uninstallPackage = true,
   refreshRegistry = true,
   resolveGitHub = true,
   preparePackage = true,

@@ -4,8 +4,8 @@
 
 The manager ships a curated preview catalog. The one human-edited source is
 `registry/catalog-v1.json`; authenticated generated copies are stored under
-`registry/bundled` and included in each manager package. Direct public GitHub
-and local-folder operations remain available.
+`registry/bundled` and included in each manager package. Direct GitHub and
+local-folder operations remain available.
 
 Catalog inclusion is version-specific. It means the exact package bytes or
 repository commit were reviewed and pinned; it is not a blanket endorsement of

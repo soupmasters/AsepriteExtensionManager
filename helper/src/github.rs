@@ -1,13 +1,16 @@
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::time::Duration;
 
-use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
+use percent_encoding::{percent_decode_str, utf8_percent_encode, NON_ALPHANUMERIC};
 use reqwest::header::{HeaderMap, ETAG, IF_NONE_MATCH};
 use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use tokio::io::AsyncReadExt;
+use tokio::process::Command;
 use url::Url;
 
 use crate::package::{
@@ -16,9 +19,19 @@ use crate::package::{
 };
 use crate::protocol::{RpcError, RpcResult};
 use crate::state::{atomic_write, State};
+use crate::tooling::{self, Tool};
 use crate::VERSION;
 
 const API_ROOT: &str = "https://api.github.com";
+const GH_JSON_BYTES: u64 = 4 * 1024 * 1024;
+const GH_JSON_TIMEOUT: Duration = Duration::from_secs(30);
+const GH_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(120);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GitHubAccess {
+    Public,
+    GitHubCli,
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum GitHubTarget {
@@ -187,7 +200,42 @@ impl GitHubClient {
                         "direct GitHub URL must identify an .aseprite-extension asset",
                     ));
                 }
-                let downloaded = self.download(url.clone()).await?;
+                let (downloaded, asset_id) = match self.download(url.clone()).await {
+                    Ok(downloaded) => (downloaded, None),
+                    Err(public_error) if public_request_can_fallback(&public_error) => {
+                        let encoded_tag = encode_github_path_value(&tag, "release tag")?;
+                        let endpoint = format!(
+                            "{API_ROOT}/repos/{owner}/{repository}/releases/tags/{encoded_tag}"
+                        );
+                        let api_path =
+                            format!("repos/{owner}/{repository}/releases/tags/{encoded_tag}");
+                        let (release, _) = self
+                            .get_json_with_gh::<Release>(&endpoint, &api_path)
+                            .await?;
+                        let mut matching = release
+                            .assets
+                            .into_iter()
+                            .filter(|asset| asset.name == asset_name);
+                        let selected = matching.next().ok_or_else(|| {
+                            RpcError::invalid(
+                                "NOT_FOUND",
+                                "the private GitHub release does not contain that asset",
+                            )
+                        })?;
+                        if matching.next().is_some() {
+                            return Err(RpcError::invalid(
+                                "INVALID_GITHUB_RESPONSE",
+                                "GitHub returned duplicate release asset names",
+                            ));
+                        }
+                        let fallback = self
+                            .download_release_asset_with_gh(&owner, &repository, selected.id)
+                            .await;
+                        let downloaded = preserve_public_rate_limit(public_error, fallback)?;
+                        (downloaded, Some(selected.id))
+                    }
+                    Err(error) => return Err(error),
+                };
                 let expected_version = expected_version_from_tag(&tag);
                 let package = validate_and_stage(
                     &self.state,
@@ -204,7 +252,7 @@ impl GitHubClient {
                         repository: format!("https://github.com/{owner}/{repository}"),
                         immutable_url: url.to_string(),
                         release: Some(tag),
-                        asset_id: None,
+                        asset_id,
                         asset_name: Some(asset_name),
                         commit: None,
                         tracked_ref: None,
@@ -399,10 +447,25 @@ impl GitHubClient {
         selection: Option<String>,
     ) -> RpcResult<ResolveResult> {
         let repository_url = format!("https://github.com/{owner}/{repository}");
+        let saved_asset_selection = selection.is_some();
+        let (default_reference, mut access) = if requested_ref.is_none() {
+            let endpoint = format!("{API_ROOT}/repos/{owner}/{repository}");
+            let api_path = format!("repos/{owner}/{repository}");
+            let (metadata, resolved_access) = self
+                .get_json_with_gh::<Repository>(&endpoint, &api_path)
+                .await?;
+            (Some(metadata.default_branch), resolved_access)
+        } else {
+            (None, GitHubAccess::Public)
+        };
         if requested_ref.is_none() {
             let endpoint = format!("{API_ROOT}/repos/{owner}/{repository}/releases/latest");
-            match self.get_json::<Release>(&endpoint).await {
-                Ok(release) if !release.draft && !release.prerelease => {
+            let api_path = format!("repos/{owner}/{repository}/releases/latest");
+            match self
+                .get_optional_json_for_access::<Release>(&endpoint, &api_path, access)
+                .await?
+            {
+                Some((release, release_access)) if !release.draft && !release.prerelease => {
                     let mut assets: Vec<_> = release
                         .assets
                         .into_iter()
@@ -448,7 +511,15 @@ impl GitHubClient {
                         let url = Url::parse(&selected.browser_download_url).map_err(|error| {
                             RpcError::invalid("INVALID_GITHUB_RESPONSE", error.to_string())
                         })?;
-                        let downloaded = self.download(url.clone()).await?;
+                        let downloaded = self
+                            .download_release_asset(
+                                owner,
+                                repository,
+                                selected.id,
+                                url.clone(),
+                                release_access,
+                            )
+                            .await?;
                         let expected_version = expected_version_from_tag(&release.tag_name);
                         let package = validate_and_stage(
                             &self.state,
@@ -474,21 +545,32 @@ impl GitHubClient {
                     }
                     let _ = release.html_url;
                 }
-                Err(error) if error.code == "NOT_FOUND" => {}
-                Err(error) => return Err(error),
                 _ => {}
             }
+            allow_snapshot_after_release_lookup(saved_asset_selection)?;
         }
 
-        let reference = if let Some(reference) = requested_ref {
-            reference.to_owned()
-        } else {
-            let endpoint = format!("{API_ROOT}/repos/{owner}/{repository}");
-            self.get_json::<Repository>(&endpoint).await?.default_branch
-        };
-        let encoded_ref = utf8_percent_encode(&reference, NON_ALPHANUMERIC).to_string();
+        let reference = requested_ref
+            .map(ToOwned::to_owned)
+            .or(default_reference)
+            .ok_or_else(|| RpcError::internal("GitHub repository has no reference to resolve"))?;
+        let encoded_ref = encode_github_path_value(&reference, "repository ref")?;
         let endpoint = format!("{API_ROOT}/repos/{owner}/{repository}/commits/{encoded_ref}");
-        let commit = self.get_json::<Commit>(&endpoint).await?.sha;
+        let api_path = format!("repos/{owner}/{repository}/commits/{encoded_ref}");
+        let (commit_response, commit_access) = match access {
+            GitHubAccess::Public => {
+                self.get_json_with_gh::<Commit>(&endpoint, &api_path)
+                    .await?
+            }
+            GitHubAccess::GitHubCli => (
+                self.gh_api_json::<Commit>(&api_path).await?,
+                GitHubAccess::GitHubCli,
+            ),
+        };
+        if commit_access == GitHubAccess::GitHubCli {
+            access = GitHubAccess::GitHubCli;
+        }
+        let commit = commit_response.sha;
         if commit.len() != 40
             || !commit
                 .chars()
@@ -503,7 +585,22 @@ impl GitHubClient {
             "https://codeload.github.com/{owner}/{repository}/zip/{commit}"
         ))
         .map_err(|error| RpcError::internal(error.to_string()))?;
-        let downloaded = self.download(url.clone()).await?;
+        let downloaded = match access {
+            GitHubAccess::Public => match self.download(url.clone()).await {
+                Ok(downloaded) => downloaded,
+                Err(public_error) if public_request_can_fallback(&public_error) => {
+                    let fallback = self
+                        .download_snapshot_with_gh(owner, repository, &commit)
+                        .await;
+                    preserve_public_rate_limit(public_error, fallback)?
+                }
+                Err(error) => return Err(error),
+            },
+            GitHubAccess::GitHubCli => {
+                self.download_snapshot_with_gh(owner, repository, &commit)
+                    .await?
+            }
+        };
         let package = package_repository_archive(&self.state, &downloaded)?;
         Ok(ResolveResult::Ready {
             package: Box::new(package),
@@ -518,6 +615,150 @@ impl GitHubClient {
                 tracked_ref: Some(reference),
             }),
         })
+    }
+
+    async fn get_json_with_gh<T>(
+        &self,
+        public_endpoint: &str,
+        gh_endpoint: &str,
+    ) -> RpcResult<(T, GitHubAccess)>
+    where
+        T: for<'de> Deserialize<'de>,
+    {
+        match self.get_json(public_endpoint).await {
+            Ok(value) => Ok((value, GitHubAccess::Public)),
+            Err(public_error) if public_request_can_fallback(&public_error) => {
+                let fallback = self
+                    .gh_api_json(gh_endpoint)
+                    .await
+                    .map(|value| (value, GitHubAccess::GitHubCli));
+                preserve_public_rate_limit(public_error, fallback)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn get_optional_json_for_access<T>(
+        &self,
+        public_endpoint: &str,
+        gh_endpoint: &str,
+        access: GitHubAccess,
+    ) -> RpcResult<Option<(T, GitHubAccess)>>
+    where
+        T: for<'de> Deserialize<'de>,
+    {
+        match access {
+            GitHubAccess::Public => match self.get_json(public_endpoint).await {
+                Ok(value) => Ok(Some((value, GitHubAccess::Public))),
+                Err(public_error) if public_error.code == "GITHUB_RATE_LIMITED" => {
+                    let fallback = self
+                        .gh_api_json(gh_endpoint)
+                        .await
+                        .map(|value| Some((value, GitHubAccess::GitHubCli)))
+                        .or_else(|error| {
+                            if error.code == "NOT_FOUND" {
+                                Ok(None)
+                            } else {
+                                Err(error)
+                            }
+                        });
+                    preserve_public_rate_limit(public_error, fallback)
+                }
+                Err(error) if error.code == "NOT_FOUND" => Ok(None),
+                Err(error) => Err(error),
+            },
+            GitHubAccess::GitHubCli => match self.gh_api_json(gh_endpoint).await {
+                Ok(value) => Ok(Some((value, GitHubAccess::GitHubCli))),
+                Err(error) if error.code == "NOT_FOUND" => Ok(None),
+                Err(error) => Err(error),
+            },
+        }
+    }
+
+    async fn download_release_asset(
+        &self,
+        owner: &str,
+        repository: &str,
+        asset_id: u64,
+        public_url: Url,
+        access: GitHubAccess,
+    ) -> RpcResult<PathBuf> {
+        let mut public_error = None;
+        if access == GitHubAccess::Public {
+            match self.download(public_url).await {
+                Ok(downloaded) => return Ok(downloaded),
+                Err(error) if public_request_can_fallback(&error) => public_error = Some(error),
+                Err(error) => return Err(error),
+            }
+        }
+        let fallback = self
+            .download_release_asset_with_gh(owner, repository, asset_id)
+            .await;
+        match public_error {
+            Some(public_error) => preserve_public_rate_limit(public_error, fallback),
+            None => fallback,
+        }
+    }
+
+    async fn download_release_asset_with_gh(
+        &self,
+        owner: &str,
+        repository: &str,
+        asset_id: u64,
+    ) -> RpcResult<PathBuf> {
+        let endpoint = format!("repos/{owner}/{repository}/releases/assets/{asset_id}");
+        self.gh_api_download(&endpoint, "application/octet-stream")
+            .await
+    }
+
+    async fn download_snapshot_with_gh(
+        &self,
+        owner: &str,
+        repository: &str,
+        commit: &str,
+    ) -> RpcResult<PathBuf> {
+        if commit.len() != 40 || !commit.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(RpcError::invalid(
+                "INVALID_GITHUB_RESPONSE",
+                "GitHub returned an invalid commit identity",
+            ));
+        }
+        let endpoint = format!("repos/{owner}/{repository}/zipball/{commit}");
+        self.gh_api_download(&endpoint, "application/vnd.github+json")
+            .await
+    }
+
+    async fn gh_api_json<T>(&self, endpoint: &str) -> RpcResult<T>
+    where
+        T: for<'de> Deserialize<'de>,
+    {
+        let body = run_gh_api(
+            endpoint,
+            "application/vnd.github+json",
+            GH_JSON_BYTES,
+            GH_JSON_TIMEOUT,
+            GhOutputKind::Json,
+        )
+        .await?;
+        serde_json::from_slice(&body)
+            .map_err(|error| RpcError::invalid("INVALID_GITHUB_RESPONSE", error.to_string()))
+    }
+
+    async fn gh_api_download(&self, endpoint: &str, accept: &str) -> RpcResult<PathBuf> {
+        let body = run_gh_api(
+            endpoint,
+            accept,
+            MAX_ARCHIVE_BYTES,
+            GH_DOWNLOAD_TIMEOUT,
+            GhOutputKind::Archive,
+        )
+        .await?;
+        let mut temporary = tempfile::NamedTempFile::new_in(self.state.root().join("staging"))
+            .map_err(RpcError::io)?;
+        temporary.write_all(&body).map_err(RpcError::io)?;
+        temporary.as_file_mut().sync_all().map_err(RpcError::io)?;
+        let (path, _, _) = self.state.stage_file(temporary.path())?;
+        Ok(path)
     }
 
     async fn get_json<T>(&self, endpoint: &str) -> RpcResult<T>
@@ -603,6 +844,17 @@ impl GitHubClient {
             .await
             .map_err(|error| RpcError::network(error.to_string()))?;
         check_rate_limit(response.status(), response.headers())?;
+        if matches!(
+            response.status(),
+            StatusCode::NOT_FOUND | StatusCode::UNAUTHORIZED
+        ) || is_github_sign_in_url(response.url())
+        {
+            return Err(RpcError::new(
+                "NOT_FOUND",
+                "GitHub download was not found publicly",
+                false,
+            ));
+        }
         if !response.status().is_success() {
             return Err(RpcError::network(format!(
                 "download returned HTTP {}",
@@ -633,6 +885,271 @@ impl GitHubClient {
         let (path, _, _) = self.state.stage_file(temporary.path())?;
         Ok(path)
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GhOutputKind {
+    Json,
+    Archive,
+}
+
+async fn run_gh_api(
+    endpoint: &str,
+    accept: &str,
+    maximum_bytes: u64,
+    deadline: Duration,
+    output_kind: GhOutputKind,
+) -> RpcResult<Vec<u8>> {
+    let executable = tooling::find(Tool::Gh).await.ok_or_else(|| {
+        RpcError::invalid(
+            "GITHUB_CLI_UNAVAILABLE",
+            "this repository is not public; install GitHub CLI and run gh auth login",
+        )
+    })?;
+    run_gh_api_with_executable(
+        &executable,
+        endpoint,
+        accept,
+        maximum_bytes,
+        deadline,
+        output_kind,
+    )
+    .await
+}
+
+async fn run_gh_api_with_executable(
+    executable: &Path,
+    endpoint: &str,
+    accept: &str,
+    maximum_bytes: u64,
+    deadline: Duration,
+    output_kind: GhOutputKind,
+) -> RpcResult<Vec<u8>> {
+    validate_gh_api_endpoint(endpoint)?;
+    let mut command = Command::new(executable);
+    command
+        .arg("api")
+        .arg("--hostname")
+        .arg("github.com")
+        .arg("--method")
+        .arg("GET")
+        .arg("-H")
+        .arg(format!("Accept: {accept}"))
+        .arg("-H")
+        .arg("X-GitHub-Api-Version: 2022-11-28")
+        .arg(endpoint)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .env("GH_PROMPT_DISABLED", "1")
+        .env("GH_NO_UPDATE_NOTIFIER", "1")
+        .env("GH_NO_EXTENSION_UPDATE_NOTIFIER", "1")
+        .env("GH_PAGER", "cat")
+        .env("PAGER", "cat")
+        .env("NO_COLOR", "1")
+        .env("CLICOLOR", "0")
+        .kill_on_drop(true);
+    configure_hidden_command(&mut command);
+
+    let mut child = command.spawn().map_err(|_| {
+        RpcError::invalid(
+            "GITHUB_CLI_UNAVAILABLE",
+            "GitHub CLI could not be started; reinstall it or check its permissions",
+        )
+    })?;
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| RpcError::internal("GitHub CLI stdout was unavailable"))?;
+    let operation = async {
+        let bytes = read_bounded_gh_output(&mut stdout, maximum_bytes, output_kind).await?;
+        let status = child.wait().await.map_err(RpcError::io)?;
+        Ok::<_, RpcError>((status, bytes))
+    };
+    let outcome = match tokio::time::timeout(deadline, operation).await {
+        Ok(Ok(outcome)) => outcome,
+        Ok(Err(error)) => {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            return Err(error);
+        }
+        Err(_) => {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            return Err(RpcError::new(
+                "GITHUB_CLI_TIMEOUT",
+                "GitHub CLI did not finish in time",
+                true,
+            ));
+        }
+    };
+    if outcome.0.success() {
+        return Ok(outcome.1);
+    }
+    if gh_json_is_not_found(&outcome.1) {
+        return Err(RpcError::new(
+            "NOT_FOUND",
+            "GitHub resource was not found",
+            false,
+        ));
+    }
+    if gh_json_is_rate_limited(&outcome.1) {
+        return Err(RpcError::new(
+            "GITHUB_RATE_LIMITED",
+            "GitHub rate limit was reached",
+            true,
+        ));
+    }
+    if outcome.0.code() == Some(4) {
+        return Err(RpcError::invalid(
+            "GITHUB_CLI_AUTH_REQUIRED",
+            "GitHub CLI is not signed in; run gh auth login for github.com",
+        ));
+    }
+    Err(RpcError::new(
+        "GITHUB_CLI_REQUEST_FAILED",
+        "GitHub CLI could not access this repository; check gh auth status and repository access",
+        false,
+    ))
+}
+
+fn gh_json_is_not_found(body: &[u8]) -> bool {
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return false;
+    };
+    match value.get("status") {
+        Some(serde_json::Value::Number(status)) => status.as_u64() == Some(404),
+        Some(serde_json::Value::String(status)) => status == "404",
+        _ => false,
+    }
+}
+
+fn gh_json_is_rate_limited(body: &[u8]) -> bool {
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return false;
+    };
+    let status = match value.get("status") {
+        Some(serde_json::Value::Number(status)) => status.as_u64(),
+        Some(serde_json::Value::String(status)) => status.parse().ok(),
+        _ => None,
+    };
+    if status == Some(429) {
+        return true;
+    }
+    status == Some(403)
+        && value
+            .get("message")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|message| message.to_ascii_lowercase().contains("rate limit"))
+}
+
+fn public_request_can_fallback(error: &RpcError) -> bool {
+    matches!(error.code.as_str(), "NOT_FOUND" | "GITHUB_RATE_LIMITED")
+}
+
+fn allow_snapshot_after_release_lookup(saved_asset_selection: bool) -> RpcResult<()> {
+    if saved_asset_selection {
+        return Err(RpcError::invalid(
+            "SAVED_RELEASE_ASSET_UNAVAILABLE",
+            "the saved GitHub release asset is not available in the latest stable release",
+        ));
+    }
+    Ok(())
+}
+
+fn preserve_public_rate_limit<T>(public_error: RpcError, fallback: RpcResult<T>) -> RpcResult<T> {
+    match fallback {
+        Err(error)
+            if public_error.code == "GITHUB_RATE_LIMITED"
+                && error.code == "GITHUB_CLI_UNAVAILABLE" =>
+        {
+            Err(public_error)
+        }
+        result => result,
+    }
+}
+
+async fn read_bounded_gh_output<R>(
+    reader: &mut R,
+    maximum_bytes: u64,
+    output_kind: GhOutputKind,
+) -> RpcResult<Vec<u8>>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let mut bytes = Vec::new();
+    let mut buffer = vec![0_u8; 64 * 1024];
+    loop {
+        let count = reader.read(&mut buffer).await.map_err(RpcError::io)?;
+        if count == 0 {
+            return Ok(bytes);
+        }
+        if (bytes.len() as u64).saturating_add(count as u64) > maximum_bytes {
+            let (code, message) = match output_kind {
+                GhOutputKind::Json => (
+                    "INVALID_GITHUB_RESPONSE",
+                    "GitHub CLI returned an unexpectedly large API response",
+                ),
+                GhOutputKind::Archive => ("ARCHIVE_TOO_LARGE", "download exceeds the 64 MiB limit"),
+            };
+            return Err(RpcError::invalid(code, message));
+        }
+        bytes.extend_from_slice(&buffer[..count]);
+    }
+}
+
+fn validate_gh_api_endpoint(endpoint: &str) -> RpcResult<()> {
+    let valid_percent_encoding = endpoint.as_bytes().iter().enumerate().all(|(index, byte)| {
+        *byte != b'%'
+            || endpoint
+                .as_bytes()
+                .get(index + 1..index + 3)
+                .map(|digits| digits.iter().all(u8::is_ascii_hexdigit))
+                .unwrap_or(false)
+    });
+    if endpoint.len() > 1024
+        || !endpoint.starts_with("repos/")
+        || endpoint
+            .split('/')
+            .any(|component| component.is_empty() || component == "." || component == "..")
+        || !endpoint.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'-' | b'.' | b'_' | b'~' | b'%')
+        })
+        || !valid_percent_encoding
+    {
+        return Err(RpcError::invalid(
+            "INVALID_GITHUB_URL",
+            "GitHub API endpoint is invalid",
+        ));
+    }
+    Ok(())
+}
+
+fn encode_github_path_value(value: &str, label: &str) -> RpcResult<String> {
+    if value.is_empty()
+        || value.len() > 255
+        || value
+            .chars()
+            .any(|character| character.is_control() || character == '\0')
+    {
+        return Err(RpcError::invalid(
+            "INVALID_GITHUB_URL",
+            format!("invalid GitHub {label}"),
+        ));
+    }
+    Ok(utf8_percent_encode(value, NON_ALPHANUMERIC).to_string())
+}
+
+fn configure_hidden_command(command: &mut Command) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
+
+        command.as_std_mut().creation_flags(CREATE_NO_WINDOW);
+    }
+    #[cfg(not(windows))]
+    let _ = command;
 }
 
 fn select_manager_release(
@@ -745,18 +1262,29 @@ pub fn parse_github_url(value: &str) -> RpcResult<GitHubTarget> {
     if url.scheme() != "https" || url.host_str() != Some("github.com") {
         return Err(RpcError::invalid(
             "INVALID_GITHUB_URL",
-            "only public https://github.com URLs are supported",
+            "only https://github.com URLs are supported",
         ));
     }
-    if url.username() != "" || url.password().is_some() || url.port().is_some() {
+    if url.username() != ""
+        || url.password().is_some()
+        || url.port().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
         return Err(RpcError::invalid(
             "INVALID_GITHUB_URL",
-            "credentials and custom ports are unsupported",
+            "credentials, query strings, fragments, and custom ports are unsupported",
         ));
     }
-    let segments: Vec<_> = url
+    let segments: Vec<String> = url
         .path_segments()
-        .map(|segments| segments.filter(|segment| !segment.is_empty()).collect())
+        .map(|segments| {
+            segments
+                .filter(|segment| !segment.is_empty())
+                .map(|segment| decode_github_path_segment(segment, "URL path"))
+                .collect::<RpcResult<Vec<_>>>()
+        })
+        .transpose()?
         .unwrap_or_default();
     if segments.len() < 2 {
         return Err(RpcError::invalid(
@@ -764,9 +1292,9 @@ pub fn parse_github_url(value: &str) -> RpcResult<GitHubTarget> {
             "URL must identify a GitHub repository",
         ));
     }
-    let owner = validate_identifier(segments[0], "owner")?;
+    let owner = validate_identifier(&segments[0], "owner")?;
     let repository = validate_identifier(
-        segments[1].strip_suffix(".git").unwrap_or(segments[1]),
+        segments[1].strip_suffix(".git").unwrap_or(&segments[1]),
         "repository",
     )?;
     if segments.len() >= 6 && segments[2] == "releases" && segments[3] == "download" {
@@ -815,6 +1343,39 @@ fn validate_identifier(value: &str, label: &str) -> RpcResult<String> {
     Ok(value.to_owned())
 }
 
+fn decode_github_path_segment(value: &str, label: &str) -> RpcResult<String> {
+    let bytes = value.as_bytes();
+    let valid_percent_encoding = bytes.iter().enumerate().all(|(index, byte)| {
+        *byte != b'%'
+            || bytes
+                .get(index + 1..index + 3)
+                .map(|digits| digits.iter().all(u8::is_ascii_hexdigit))
+                .unwrap_or(false)
+    });
+    if !valid_percent_encoding {
+        return Err(RpcError::invalid(
+            "INVALID_GITHUB_URL",
+            format!("invalid GitHub {label}"),
+        ));
+    }
+    let decoded = percent_decode_str(value).decode_utf8().map_err(|_| {
+        RpcError::invalid(
+            "INVALID_GITHUB_URL",
+            format!("invalid UTF-8 in GitHub {label}"),
+        )
+    })?;
+    if decoded
+        .chars()
+        .any(|character| character.is_control() || character == '\0')
+    {
+        return Err(RpcError::invalid(
+            "INVALID_GITHUB_URL",
+            format!("invalid GitHub {label}"),
+        ));
+    }
+    Ok(decoded.into_owned())
+}
+
 fn is_allowed_download_host(host: &str) -> bool {
     matches!(
         host,
@@ -824,6 +1385,11 @@ fn is_allowed_download_host(host: &str) -> bool {
             | "objects.githubusercontent.com"
             | "release-assets.githubusercontent.com"
     ) || host.ends_with(".githubusercontent.com")
+}
+
+fn is_github_sign_in_url(url: &Url) -> bool {
+    url.host_str() == Some("github.com")
+        && matches!(url.path(), "/login" | "/session" | "/sessions/two-factor")
 }
 
 fn check_rate_limit(status: StatusCode, headers: &HeaderMap) -> RpcResult<()> {
@@ -1126,6 +1692,24 @@ mod tests {
                 ..
             } if reference == "main"
         ));
+        assert!(matches!(
+            parse_github_url(
+                "https://github.com/example/sample/releases/download/release%2F1/My%20Tool-%E2%9C%93.aseprite-extension"
+            )
+            .unwrap(),
+            GitHubTarget::ReleaseAsset {
+                tag,
+                asset_name,
+                ..
+            } if tag == "release/1" && asset_name == "My Tool-✓.aseprite-extension"
+        ));
+        assert!(matches!(
+            parse_github_url("https://github.com/example/sample/tree/feature%2Fprivate").unwrap(),
+            GitHubTarget::Repository {
+                requested_ref: Some(reference),
+                ..
+            } if reference == "feature/private"
+        ));
     }
 
     #[test]
@@ -1148,11 +1732,36 @@ mod tests {
     }
 
     #[test]
-    fn refuses_non_public_and_ambiguous_urls() {
+    fn saved_release_asset_cannot_fall_through_to_a_snapshot() {
+        let error = allow_snapshot_after_release_lookup(true)
+            .expect_err("saved release lineage must not change to a branch snapshot");
+        assert_eq!(error.code, "SAVED_RELEASE_ASSET_UNAVAILABLE");
+        allow_snapshot_after_release_lookup(false).unwrap();
+    }
+
+    #[test]
+    fn refuses_non_github_and_ambiguous_urls() {
         assert!(parse_github_url("http://github.com/example/sample").is_err());
         assert!(parse_github_url("https://git.example.com/example/sample").is_err());
         assert!(parse_github_url("https://github.com/example/sample/issues/1").is_err());
         assert!(parse_github_url("https://token@github.com/example/sample").is_err());
+        assert!(parse_github_url("https://github.com/example/sample?token=secret").is_err());
+        assert!(parse_github_url("https://github.com/example/sample#secret").is_err());
+        assert!(parse_github_url("https://github.com/example/sample/tree/%FF").is_err());
+        assert!(parse_github_url("https://github.com/example/sample/tree/%ZZ").is_err());
+    }
+
+    #[test]
+    fn recognizes_github_sign_in_redirects_for_private_downloads() {
+        assert!(is_github_sign_in_url(
+            &Url::parse("https://github.com/login?return_to=%2Fprivate%2Frepo").unwrap()
+        ));
+        assert!(!is_github_sign_in_url(
+            &Url::parse("https://github.com/example/sample/releases/download/v1/a.zip").unwrap()
+        ));
+        assert!(!is_github_sign_in_url(
+            &Url::parse("https://example.com/login").unwrap()
+        ));
     }
 
     #[test]
@@ -1187,6 +1796,207 @@ mod tests {
             append_download_chunk(&mut output, &mut total, b"x").expect_err("oversize rejected");
         assert_eq!(error.code, "ARCHIVE_TOO_LARGE");
         assert_eq!(fs::metadata(path).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn gh_api_endpoints_are_strictly_scoped_to_repository_paths() {
+        for endpoint in [
+            "repos/example/sample",
+            "repos/example/sample/releases/assets/42",
+            "repos/example/sample/commits/feature%2Fprivate",
+            "repos/example/sample/zipball/1111111111111111111111111111111111111111",
+        ] {
+            validate_gh_api_endpoint(endpoint).unwrap();
+        }
+
+        for endpoint in [
+            "user",
+            "repos/example/../other",
+            "repos/example/sample?token=value",
+            "repos/example/sample/%ZZ",
+            "repos/example/sample\n--hostname",
+            "repos//sample",
+        ] {
+            assert!(
+                validate_gh_api_endpoint(endpoint).is_err(),
+                "endpoint should be rejected: {endpoint:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_gh_executable_is_reported_without_a_shell_fallback() {
+        let temporary = tempfile::tempdir().unwrap();
+        let error = run_gh_api_with_executable(
+            &temporary.path().join("missing-gh"),
+            "repos/example/sample",
+            "application/vnd.github+json",
+            GH_JSON_BYTES,
+            GH_JSON_TIMEOUT,
+            GhOutputKind::Json,
+        )
+        .await
+        .expect_err("a missing GitHub CLI executable must fail");
+        assert_eq!(error.code, "GITHUB_CLI_UNAVAILABLE");
+    }
+
+    #[cfg(unix)]
+    fn fake_gh(script: &str) -> (tempfile::TempDir, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("gh");
+        fs::write(&path, script).unwrap();
+        let mut permissions = fs::metadata(&path).unwrap().permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&path, permissions).unwrap();
+        (temporary, path)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn gh_api_uses_fixed_arguments_and_maps_cli_failures() {
+        let (success_directory, success) = fake_gh(
+            r#"#!/bin/sh
+test "$#" -eq 10 || exit 9
+test "$1" = "api" || exit 9
+test "$2" = "--hostname" || exit 9
+test "$3" = "github.com" || exit 9
+test "$4" = "--method" || exit 9
+test "$5" = "GET" || exit 9
+test "${10}" = "repos/example/sample" || exit 9
+printf '%s' '{"ok":true}'
+"#,
+        );
+        let output = run_gh_api_with_executable(
+            &success,
+            "repos/example/sample",
+            "application/vnd.github+json",
+            GH_JSON_BYTES,
+            GH_JSON_TIMEOUT,
+            GhOutputKind::Json,
+        )
+        .await
+        .unwrap();
+        assert_eq!(output, br#"{"ok":true}"#);
+        drop(success_directory);
+
+        let (_auth_directory, auth) = fake_gh("#!/bin/sh\nexit 4\n");
+        let auth_error = run_gh_api_with_executable(
+            &auth,
+            "repos/example/sample",
+            "application/vnd.github+json",
+            GH_JSON_BYTES,
+            GH_JSON_TIMEOUT,
+            GhOutputKind::Json,
+        )
+        .await
+        .expect_err("exit 4 means gh authentication is required");
+        assert_eq!(auth_error.code, "GITHUB_CLI_AUTH_REQUIRED");
+
+        let (_rate_directory, rate) = fake_gh(
+            "#!/bin/sh\nprintf '%s' '{\"message\":\"API rate limit exceeded\",\"status\":\"403\"}'\nexit 1\n",
+        );
+        let rate_error = run_gh_api_with_executable(
+            &rate,
+            "repos/example/sample",
+            "application/octet-stream",
+            GH_JSON_BYTES,
+            GH_JSON_TIMEOUT,
+            GhOutputKind::Archive,
+        )
+        .await
+        .expect_err("GitHub CLI rate limits must stay retryable");
+        assert_eq!(rate_error.code, "GITHUB_RATE_LIMITED");
+        assert!(rate_error.retryable);
+
+        let (_missing_directory, missing) = fake_gh(
+            "#!/bin/sh\nprintf '%s' '{\"message\":\"Not Found\",\"status\":404}'\nexit 1\n",
+        );
+        let missing_error = run_gh_api_with_executable(
+            &missing,
+            "repos/example/sample/releases/assets/42",
+            "application/octet-stream",
+            GH_JSON_BYTES,
+            GH_JSON_TIMEOUT,
+            GhOutputKind::Archive,
+        )
+        .await
+        .expect_err("archive endpoint errors still contain GitHub JSON");
+        assert_eq!(missing_error.code, "NOT_FOUND");
+    }
+
+    #[test]
+    fn only_explicit_gh_json_404_responses_are_optional() {
+        assert!(gh_json_is_not_found(
+            br#"{"message":"Not Found","status":"404"}"#
+        ));
+        assert!(gh_json_is_not_found(
+            br#"{"message":"Not Found","status":404}"#
+        ));
+        assert!(!gh_json_is_not_found(br#"{"message":"Not Found"}"#));
+        assert!(!gh_json_is_not_found(br#"{"status":"401"}"#));
+        assert!(!gh_json_is_not_found(b"not json"));
+    }
+
+    #[test]
+    fn classifies_explicit_gh_rate_limit_responses() {
+        assert!(gh_json_is_rate_limited(
+            br#"{"message":"API rate limit exceeded","status":"403"}"#
+        ));
+        assert!(gh_json_is_rate_limited(
+            br#"{"message":"Too many requests","status":429}"#
+        ));
+        assert!(!gh_json_is_rate_limited(
+            br#"{"message":"Resource not accessible","status":"403"}"#
+        ));
+        assert!(!gh_json_is_rate_limited(b"not json"));
+
+        let not_found = RpcError::new("NOT_FOUND", "missing", false);
+        let limited = RpcError::new("GITHUB_RATE_LIMITED", "limited", true);
+        let denied = RpcError::new("GITHUB_CLI_REQUEST_FAILED", "denied", false);
+        assert!(public_request_can_fallback(&not_found));
+        assert!(public_request_can_fallback(&limited));
+        assert!(!public_request_can_fallback(&denied));
+
+        let unavailable = RpcError::new("GITHUB_CLI_UNAVAILABLE", "missing", false);
+        let preserved = preserve_public_rate_limit::<()>(limited, Err(unavailable))
+            .expect_err("the original public rate limit should remain actionable");
+        assert_eq!(preserved.code, "GITHUB_RATE_LIMITED");
+    }
+
+    #[test]
+    fn github_refs_are_encoded_as_one_api_path_value() {
+        assert_eq!(
+            encode_github_path_value("feature/private build", "repository ref").unwrap(),
+            "feature%2Fprivate%20build"
+        );
+        assert!(encode_github_path_value("bad\nref", "repository ref").is_err());
+        assert!(encode_github_path_value(&"x".repeat(256), "repository ref").is_err());
+    }
+
+    #[tokio::test]
+    async fn gh_archive_output_is_rejected_at_the_download_limit() {
+        let (mut writer, mut reader) = tokio::io::duplex(16);
+        writer.write_all(b"12345").await.unwrap();
+        writer.shutdown().await.unwrap();
+
+        let error = read_bounded_gh_output(&mut reader, 4, GhOutputKind::Archive)
+            .await
+            .expect_err("oversize GitHub CLI output must be rejected");
+        assert_eq!(error.code, "ARCHIVE_TOO_LARGE");
+    }
+
+    #[tokio::test]
+    async fn gh_json_output_is_bounded_separately_from_archives() {
+        let (mut writer, mut reader) = tokio::io::duplex(16);
+        writer.write_all(b"12345").await.unwrap();
+        writer.shutdown().await.unwrap();
+
+        let error = read_bounded_gh_output(&mut reader, 4, GhOutputKind::Json)
+            .await
+            .expect_err("oversize GitHub CLI JSON must be rejected");
+        assert_eq!(error.code, "INVALID_GITHUB_RESPONSE");
     }
 
     #[tokio::test]

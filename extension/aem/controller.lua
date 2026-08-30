@@ -93,6 +93,7 @@ function Controller.new(environment)
     pendingStartupManagerUpdateVersion = nil,
     selfUpdateTimer = nil,
     activeOperation = nil,
+    restartRequired = false,
     refreshGeneration = 0,
     closed = false,
   }, Controller)
@@ -206,6 +207,32 @@ function Controller:_ensure_rpc()
     self.rpc = factory and factory(self.environment) or Rpc.new(self.environment)
   end
   return self.rpc
+end
+
+function Controller:_restart_blocks_management()
+  if not self.restartRequired then
+    return false
+  end
+  self.app.tip("Restart Aseprite before managing more extensions.", 4)
+  return true
+end
+
+function Controller:request_diagnostics(callback)
+  if self.closed or type(callback) ~= "function" then
+    return nil
+  end
+  return self:_ensure_rpc():request("diagnostics", {}, {
+    onSuccess = function(result)
+      if not self.closed then
+        callback(result, nil)
+      end
+    end,
+    onError = function(error_value)
+      if not self.closed then
+        callback(nil, error_value)
+      end
+    end,
+  })
 end
 
 function Controller:_shutdown_rpc(on_done)
@@ -419,6 +446,11 @@ function Controller:run_startup_check()
 end
 
 function Controller:refresh(show_errors)
+  if self:_restart_blocks_management() then
+    self.model.status = "Restart Aseprite before managing more extensions"
+    self.ui:refresh()
+    return false
+  end
   if self.activeOperation then
     return false
   end
@@ -528,7 +560,10 @@ function Controller:refresh(show_errors)
   return true
 end
 
-function Controller:_begin_operation(title, message)
+function Controller:_begin_operation(title, message, options)
+  if self:_restart_blocks_management() then
+    return nil
+  end
   if self.activeOperation then
     self.app.tip("Another extension operation is already running.", 2)
     return nil
@@ -543,20 +578,22 @@ function Controller:_begin_operation(title, message)
   self.model.status = message or "Working…"
   self.ui:refresh()
 
-  operation.progress = self.ui:show_progress(title, message, function()
-    operation.cancelled = true
-    self:_stop_self_update_timer()
-    local restart_helper = operation.selfUpdatePrepared == true and not self.closed
-    if self.activeOperation == operation then
-      self.activeOperation = nil
-      self.model.busy = false
-      self.model.status = "Operation cancelled"
-      self.ui:refresh()
-    end
-    if restart_helper then
-      self:refresh(false)
-    end
-  end)
+  if not options or options.progress ~= false then
+    operation.progress = self.ui:show_progress(title, message, function()
+      operation.cancelled = true
+      self:_stop_self_update_timer()
+      local restart_helper = operation.selfUpdatePrepared == true and not self.closed
+      if self.activeOperation == operation then
+        self.activeOperation = nil
+        self.model.busy = false
+        self.model.status = "Operation cancelled"
+        self.ui:refresh()
+      end
+      if restart_helper then
+        self:refresh(false)
+      end
+    end)
+  end
   return operation
 end
 
@@ -954,6 +991,9 @@ function Controller:_resolve_github(operation, url, selection)
 end
 
 function Controller:install_from_github()
+  if self:_restart_blocks_management() then
+    return false
+  end
   if self.activeOperation then
     return false
   end
@@ -965,7 +1005,7 @@ function Controller:install_from_github()
   if url == "" then
     self.ui:show_error("GitHub URL Required", {
       code = "missing_url",
-      message = "Enter a public GitHub repository or release asset URL.",
+      message = "Enter a public or private GitHub repository or release asset URL.",
     })
     return false
   end
@@ -979,6 +1019,9 @@ function Controller:install_from_github()
 end
 
 function Controller:sync_local_folder()
+  if self:_restart_blocks_management() then
+    return false
+  end
   if self.activeOperation then
     return false
   end
@@ -1022,6 +1065,9 @@ function Controller:sync_local_folder()
 end
 
 function Controller:install_registry_package(package)
+  if self:_restart_blocks_management() then
+    return false
+  end
   if self.model.registryExpired
     or package.yanked
     or self.activeOperation
@@ -1062,6 +1108,9 @@ end
 
 function Controller:update_package(package)
   local self_update = is_self_update(package)
+  if self:_restart_blocks_management() then
+    return false
+  end
   if self.activeOperation or (not package.managed and not self_update) then
     return false
   end
@@ -1123,6 +1172,9 @@ function Controller:update_package(package)
 end
 
 function Controller:restore_package(package)
+  if self:_restart_blocks_management() then
+    return false
+  end
   if self.activeOperation or not package then
     return false
   end
@@ -1173,6 +1225,9 @@ function Controller:restore_package(package)
 end
 
 function Controller:clear_cache()
+  if self:_restart_blocks_management() then
+    return false
+  end
   if self.activeOperation then
     return false
   end
@@ -1198,7 +1253,126 @@ function Controller:clear_cache()
   return true
 end
 
+function Controller:uninstall_package(package)
+  if self:_restart_blocks_management() then
+    return false
+  end
+  if self.activeOperation
+    or self.model.busy
+    or not package
+    or is_manager_package(package)
+  then
+    return false
+  end
+  local name = type(package.name) == "string" and package.name or nil
+  local version = package.version ~= nil and tostring(package.version) or nil
+  local path = type(package.path) == "string" and package.path or nil
+  if not name or name == "" or not version or version == "" or not path or path == "" then
+    self.ui:show_error("Uninstall Failed", {
+      code = "invalid_installed_package",
+      message = "Refresh the installed extension list and try again.",
+    })
+    return false
+  end
+
+  local display_name = tostring(package.displayName or name)
+  local message = "Uninstall "
+    .. display_name
+    .. "?\n\nIts files will be moved out of Aseprite and kept as a recovery copy. "
+    .. "Restart Aseprite immediately afterward. Until then, the extension may remain "
+    .. "partly active or stop working."
+  if type(package.source) == "table" and package.source.kind == "local" then
+    message = message .. " Your linked source folder will not be changed."
+  end
+  if not self.ui:confirm("Uninstall Extension", message, "Uninstall") then
+    return false
+  end
+
+  local operation = self:_begin_operation(
+    "Uninstall Extension",
+    "Uninstalling " .. display_name .. "…",
+    { progress = false }
+  )
+  if not operation then
+    return false
+  end
+  operation.kind = "uninstall"
+  self.refreshGeneration = self.refreshGeneration + 1
+  self.restartRequired = true
+  local ticket
+  ticket = self:_ensure_rpc():request("uninstallPackage", {
+    name = name,
+    version = version,
+    path = path,
+  }, {
+    onSuccess = function(result)
+      if operation.cancelled or self.activeOperation ~= operation then
+        return
+      end
+      if type(result) ~= "table"
+        or result.name ~= name
+        or tostring(result.version or "") ~= version
+        or result.restartRequired ~= true
+      then
+        self:_operation_error(operation, "Uninstall Failed", {
+          code = "invalid_uninstall_result",
+          message = "The helper returned an invalid uninstall result.",
+        })
+        self.model.status = "Restart Aseprite before managing more extensions"
+        self.ui:refresh()
+        return
+      end
+      local remaining = {}
+      for _, installed in ipairs(self.model.installed) do
+        if tostring(installed.path or "") ~= path then
+          remaining[#remaining + 1] = installed
+        end
+      end
+      self.model:set_installed(remaining)
+      self:_finish_operation(
+        operation,
+        "Restart Aseprite to finish removing " .. display_name
+      )
+      local notice = "Files for "
+        .. display_name
+        .. " were moved out of Aseprite. Restart Aseprite now. Until then, the extension "
+        .. "may remain partly active or stop working. Do not install, update, restore, or "
+        .. "remove extensions before restarting."
+      if type(result.recoveryPath) == "string" and result.recoveryPath ~= "" then
+        notice = notice .. "\n\nRecovery copy:\n" .. result.recoveryPath
+      end
+      if result.receiptCleanupPending == true then
+        notice = notice
+          .. "\n\nReceipt cleanup will finish the next time the manager starts."
+      end
+      self.app.alert {
+        title = "Restart Aseprite",
+        text = notice,
+        buttons = "OK",
+      }
+    end,
+    onError = function(error_value, helper_rejected)
+      if helper_rejected == true then
+        self.restartRequired = false
+      end
+      self:_operation_error(operation, "Uninstall Failed", error_value)
+      if self.restartRequired then
+        self.model.status = "Restart Aseprite before managing more extensions"
+        self.ui:refresh()
+      end
+    end,
+    onProgress = function(event)
+      self:_update_progress(operation, event)
+    end,
+  })
+  self:_set_ticket(operation, ticket)
+  return true
+end
+
 function Controller:open_native_extension_preferences(action, package)
+  if self:_restart_blocks_management() then
+    return false
+  end
   if is_manager_package(package) then
     return false
   end
@@ -1223,13 +1397,14 @@ function Controller:open_native_extension_preferences(action, package)
     buttons = "Continue",
   }
 
-  local opened, open_error = pcall(function()
-    self.app.command.Options()
+  local opened, command_result = pcall(function()
+    return self.app.command.Options()
   end)
-  if not opened then
+  if not opened or command_result == false then
     self.ui:show_error("Aseprite Preferences Failed", {
       code = "preferences_failed",
-      message = tostring(open_error),
+      message = opened and "Aseprite did not open Preferences."
+        or tostring(command_result),
     })
     return false
   end
@@ -1241,6 +1416,10 @@ function Controller:on_dialog_closed()
   self:_stop_self_update_timer()
   self.refreshGeneration = self.refreshGeneration + 1
   if self.activeOperation then
+    if self.activeOperation.kind == "uninstall" then
+      self.restartRequired = true
+      self.model.status = "Restart Aseprite before managing more extensions"
+    end
     self.activeOperation.cancelled = true
     if self.activeOperation.ticket then
       self.activeOperation.ticket.cancel()

@@ -6,7 +6,7 @@ use serde_json::Value;
 
 use crate::package::Manifest;
 use crate::protocol::{RpcError, RpcResult};
-use crate::state::{Receipt, State};
+use crate::state::{package_id_is_safe, Receipt, State};
 
 const MANAGER_NAME: &str = "aseprite-extension-manager";
 
@@ -31,6 +31,16 @@ pub struct InstalledPackage {
     pub rollback_available: bool,
 }
 
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UninstallResult {
+    pub name: String,
+    pub version: String,
+    pub recovery_path: PathBuf,
+    pub restart_required: bool,
+    pub receipt_cleanup_pending: bool,
+}
+
 pub fn scan(user_config_path: &Path, state: &State) -> RpcResult<Vec<InstalledPackage>> {
     scan_inner(user_config_path, state, None)
 }
@@ -41,6 +51,93 @@ pub fn scan_with_manager_root(
     manager_root: &Path,
 ) -> RpcResult<Vec<InstalledPackage>> {
     scan_inner(user_config_path, state, Some(manager_root))
+}
+
+pub fn uninstall(
+    user_config_path: &Path,
+    state: &State,
+    manager_root: &Path,
+    expected_name: &str,
+    expected_version: &str,
+    requested_path: &Path,
+) -> RpcResult<UninstallResult> {
+    if expected_name.eq_ignore_ascii_case(MANAGER_NAME) {
+        return Err(RpcError::invalid(
+            "SELF_UNINSTALL_RESTRICTED",
+            "Aseprite Extension Manager cannot uninstall itself",
+        ));
+    }
+
+    let requested_metadata = fs::symlink_metadata(requested_path).map_err(RpcError::io)?;
+    if requested_metadata.file_type().is_symlink() || !requested_metadata.is_dir() {
+        return Err(RpcError::invalid(
+            "INVALID_EXTENSION_PATH",
+            "the installed extension must be a real directory",
+        ));
+    }
+
+    let extensions_root =
+        fs::canonicalize(user_config_path.join("extensions")).map_err(RpcError::io)?;
+    let extension_path = fs::canonicalize(requested_path).map_err(RpcError::io)?;
+    if extension_path.parent() != Some(extensions_root.as_path()) {
+        return Err(RpcError::invalid(
+            "UNTRUSTED_EXTENSION_PATH",
+            "the extension must be a direct child of the Aseprite extensions directory",
+        ));
+    }
+    let canonical_manager_root = fs::canonicalize(manager_root).map_err(RpcError::io)?;
+    if extension_path == canonical_manager_root {
+        return Err(RpcError::invalid(
+            "SELF_UNINSTALL_RESTRICTED",
+            "Aseprite Extension Manager cannot uninstall itself",
+        ));
+    }
+
+    let manifest_path = extension_path.join("package.json");
+    let manifest_metadata = fs::symlink_metadata(&manifest_path).map_err(RpcError::io)?;
+    if manifest_metadata.file_type().is_symlink() || !manifest_metadata.is_file() {
+        return Err(RpcError::invalid(
+            "INVALID_INSTALLED_MANIFEST",
+            "the installed package manifest must be a real file",
+        ));
+    }
+    let manifest = read_manifest(&manifest_path)?;
+    if !manifest.name.eq_ignore_ascii_case(expected_name) || manifest.version != expected_version {
+        return Err(RpcError::invalid(
+            "INSTALLED_PACKAGE_CHANGED",
+            "the installed extension changed after it was scanned; refresh and try again",
+        )
+        .with_details(serde_json::json!({
+            "expectedName": expected_name,
+            "actualName": manifest.name,
+            "expectedVersion": expected_version,
+            "actualVersion": manifest.version,
+        })));
+    }
+
+    let same_name_count = scan(user_config_path, state)?
+        .iter()
+        .filter(|package| package.name.eq_ignore_ascii_case(&manifest.name))
+        .count();
+    let archive_receipt = same_name_count == 1
+        && package_id_is_safe(&manifest.name)
+        && state.read_receipt(&manifest.name)?.is_some_and(|receipt| {
+            receipt.package_name.eq_ignore_ascii_case(&manifest.name)
+                && receipt.installed_version == manifest.version
+        });
+    let quarantine = state.quarantine_extension(
+        &manifest.name,
+        &manifest.version,
+        &extension_path,
+        archive_receipt,
+    )?;
+    Ok(UninstallResult {
+        name: manifest.name,
+        version: manifest.version,
+        recovery_path: quarantine.recovery_path,
+        restart_required: true,
+        receipt_cleanup_pending: quarantine.receipt_cleanup_pending,
+    })
 }
 
 fn scan_inner(
@@ -192,6 +289,287 @@ fn read_manifest(path: &Path) -> RpcResult<Manifest> {
 mod tests {
     use super::*;
     use chrono::Utc;
+
+    fn receipt(name: &str, version: &str) -> Receipt {
+        Receipt {
+            schema_version: 1,
+            package_name: name.to_owned(),
+            source_kind: "github-release".to_owned(),
+            source: serde_json::json!({"kind":"github-release"}),
+            installed_version: version.to_owned(),
+            commit: None,
+            release: Some(format!("v{version}")),
+            asset: None,
+            artifact_sha256: "0".repeat(64),
+            artifact_byte_length: 1,
+            installed_at: Utc::now(),
+            local_folder: None,
+            content_hash: None,
+            previous_artifact: None,
+            previous_source: None,
+            previous_version: None,
+            previous_artifact_sha256: None,
+            previous_artifact_byte_length: None,
+        }
+    }
+
+    #[test]
+    fn uninstall_quarantines_the_exact_extension_and_its_receipt() {
+        let temporary = tempfile::tempdir().expect("tempdir");
+        let extensions = temporary.path().join("extensions");
+        let manager = extensions.join("manager");
+        let extension = extensions.join("Manual Folder");
+        fs::create_dir_all(&manager).expect("manager mkdir");
+        fs::create_dir_all(&extension).expect("extension mkdir");
+        fs::write(
+            extension.join("package.json"),
+            br#"{"name":"sample","version":"1.0.0"}"#,
+        )
+        .expect("manifest");
+        fs::write(extension.join("custom.lua"), b"return true").expect("custom file");
+        let state = State::new(temporary.path()).expect("state");
+        state
+            .write_receipt(&receipt("sample", "1.0.0"))
+            .expect("receipt");
+
+        let result = uninstall(
+            temporary.path(),
+            &state,
+            &manager,
+            "sample",
+            "1.0.0",
+            &extension,
+        )
+        .expect("uninstall");
+
+        assert_eq!(result.name, "sample");
+        assert_eq!(result.version, "1.0.0");
+        assert!(result.restart_required);
+        assert!(!result.receipt_cleanup_pending);
+        assert!(!extension.exists());
+        assert!(result.recovery_path.join("package.json").is_file());
+        assert!(result.recovery_path.join("custom.lua").is_file());
+        assert!(result
+            .recovery_path
+            .parent()
+            .expect("recovery directory")
+            .join("receipt.json")
+            .is_file());
+        assert!(state
+            .read_receipt("sample")
+            .expect("read receipt")
+            .is_none());
+        assert!(scan(temporary.path(), &state).expect("rescan").is_empty());
+    }
+
+    #[test]
+    fn uninstall_preserves_a_stale_receipt() {
+        let temporary = tempfile::tempdir().expect("tempdir");
+        let extensions = temporary.path().join("extensions");
+        let manager = extensions.join("manager");
+        let extension = extensions.join("sample");
+        fs::create_dir_all(&manager).expect("manager mkdir");
+        fs::create_dir_all(&extension).expect("extension mkdir");
+        fs::write(
+            extension.join("package.json"),
+            br#"{"name":"sample","version":"2.0.0"}"#,
+        )
+        .expect("manifest");
+        let state = State::new(temporary.path()).expect("state");
+        state
+            .write_receipt(&receipt("sample", "1.0.0"))
+            .expect("stale receipt");
+
+        let result = uninstall(
+            temporary.path(),
+            &state,
+            &manager,
+            "sample",
+            "2.0.0",
+            &extension,
+        )
+        .expect("uninstall");
+
+        assert!(!result.receipt_cleanup_pending);
+        assert_eq!(
+            state
+                .read_receipt("sample")
+                .expect("read receipt")
+                .expect("preserved receipt")
+                .installed_version,
+            "1.0.0"
+        );
+        assert!(!result
+            .recovery_path
+            .parent()
+            .expect("recovery directory")
+            .join("receipt.json")
+            .exists());
+    }
+
+    #[test]
+    fn uninstall_preserves_a_receipt_with_a_mismatched_identity() {
+        let temporary = tempfile::tempdir().expect("tempdir");
+        let extensions = temporary.path().join("extensions");
+        let manager = extensions.join("manager");
+        let extension = extensions.join("sample");
+        fs::create_dir_all(&manager).expect("manager mkdir");
+        fs::create_dir_all(&extension).expect("extension mkdir");
+        fs::write(
+            extension.join("package.json"),
+            br#"{"name":"sample","version":"1.0.0"}"#,
+        )
+        .expect("manifest");
+        let state = State::new(temporary.path()).expect("state");
+        let mismatched = receipt("different-package", "1.0.0");
+        fs::write(
+            state.root().join("receipts/sample.json"),
+            serde_json::to_vec_pretty(&mismatched).expect("receipt JSON"),
+        )
+        .expect("mismatched receipt");
+
+        let result = uninstall(
+            temporary.path(),
+            &state,
+            &manager,
+            "sample",
+            "1.0.0",
+            &extension,
+        )
+        .expect("uninstall");
+
+        assert!(!result.receipt_cleanup_pending);
+        assert_eq!(
+            state
+                .read_receipt("sample")
+                .expect("read receipt")
+                .expect("preserved receipt")
+                .package_name,
+            "different-package"
+        );
+        assert!(!result
+            .recovery_path
+            .parent()
+            .expect("recovery directory")
+            .join("receipt.json")
+            .exists());
+    }
+
+    #[test]
+    fn uninstall_preserves_a_receipt_shared_by_duplicate_installs() {
+        let temporary = tempfile::tempdir().expect("tempdir");
+        let extensions = temporary.path().join("extensions");
+        let manager = extensions.join("manager");
+        let first = extensions.join("sample-one");
+        let second = extensions.join("sample-two");
+        fs::create_dir_all(&manager).expect("manager mkdir");
+        for extension in [&first, &second] {
+            fs::create_dir_all(extension).expect("extension mkdir");
+            fs::write(
+                extension.join("package.json"),
+                br#"{"name":"sample","version":"1.0.0"}"#,
+            )
+            .expect("manifest");
+        }
+        let state = State::new(temporary.path()).expect("state");
+        state
+            .write_receipt(&receipt("sample", "1.0.0"))
+            .expect("receipt");
+
+        let result = uninstall(
+            temporary.path(),
+            &state,
+            &manager,
+            "sample",
+            "1.0.0",
+            &first,
+        )
+        .expect("uninstall one duplicate");
+
+        assert!(!first.exists());
+        assert!(second.is_dir());
+        assert!(!result.receipt_cleanup_pending);
+        assert!(state
+            .read_receipt("sample")
+            .expect("read receipt")
+            .is_some());
+        assert!(!result
+            .recovery_path
+            .parent()
+            .expect("recovery directory")
+            .join("receipt.json")
+            .exists());
+    }
+
+    #[test]
+    fn uninstall_rejects_changed_or_untrusted_targets_without_moving_them() {
+        let temporary = tempfile::tempdir().expect("tempdir");
+        let extensions = temporary.path().join("extensions");
+        let manager = extensions.join("manager");
+        let extension = extensions.join("sample");
+        let outside = temporary.path().join("outside");
+        for directory in [&manager, &extension, &outside] {
+            fs::create_dir_all(directory).expect("mkdir");
+        }
+        for directory in [&extension, &outside] {
+            fs::write(
+                directory.join("package.json"),
+                br#"{"name":"sample","version":"2.0.0"}"#,
+            )
+            .expect("manifest");
+        }
+        let state = State::new(temporary.path()).expect("state");
+
+        let changed = uninstall(
+            temporary.path(),
+            &state,
+            &manager,
+            "sample",
+            "1.0.0",
+            &extension,
+        )
+        .expect_err("version mismatch");
+        assert_eq!(changed.code, "INSTALLED_PACKAGE_CHANGED");
+        assert!(extension.is_dir());
+
+        let untrusted = uninstall(
+            temporary.path(),
+            &state,
+            &manager,
+            "sample",
+            "2.0.0",
+            &outside,
+        )
+        .expect_err("outside path");
+        assert_eq!(untrusted.code, "UNTRUSTED_EXTENSION_PATH");
+        assert!(outside.is_dir());
+    }
+
+    #[test]
+    fn uninstall_never_moves_the_manager() {
+        let temporary = tempfile::tempdir().expect("tempdir");
+        let manager = temporary.path().join("extensions").join("manager");
+        fs::create_dir_all(&manager).expect("manager mkdir");
+        fs::write(
+            manager.join("package.json"),
+            br#"{"name":"aseprite-extension-manager","version":"0.1.0"}"#,
+        )
+        .expect("manifest");
+        let state = State::new(temporary.path()).expect("state");
+
+        let error = uninstall(
+            temporary.path(),
+            &state,
+            &manager,
+            "aseprite-extension-manager",
+            "0.1.0",
+            &manager,
+        )
+        .expect_err("manager uninstall");
+
+        assert_eq!(error.code, "SELF_UNINSTALL_RESTRICTED");
+        assert!(manager.is_dir());
+    }
 
     #[test]
     fn discovers_unmanaged_extensions_without_mutating_them() {

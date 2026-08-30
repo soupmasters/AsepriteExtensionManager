@@ -144,6 +144,7 @@ impl ProgressEvent {
 pub enum Method {
     Ping,
     ScanInstalled,
+    UninstallPackage,
     RefreshRegistry,
     ResolveGitHub,
     PreparePackage,
@@ -166,6 +167,7 @@ impl TryFrom<&str> for Method {
         match value {
             "ping" => Ok(Self::Ping),
             "scanInstalled" => Ok(Self::ScanInstalled),
+            "uninstallPackage" => Ok(Self::UninstallPackage),
             "refreshRegistry" => Ok(Self::RefreshRegistry),
             "resolveGitHub" => Ok(Self::ResolveGitHub),
             "preparePackage" => Ok(Self::PreparePackage),
@@ -228,6 +230,10 @@ mod tests {
         assert_eq!(
             Method::try_from("scanInstalled").unwrap(),
             Method::ScanInstalled
+        );
+        assert_eq!(
+            Method::try_from("uninstallPackage").unwrap(),
+            Method::UninstallPackage
         );
         assert_eq!(
             Method::try_from("prepareSelfUpdate").unwrap(),

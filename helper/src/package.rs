@@ -14,7 +14,7 @@ use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, DateTime, ZipArchive, ZipWriter};
 
 use crate::protocol::{RpcError, RpcResult};
-use crate::state::{sha256_file, State};
+use crate::state::{package_id_is_safe, sha256_file, State};
 
 pub const MAX_ARCHIVE_BYTES: u64 = 64 * 1024 * 1024;
 pub const MAX_UNCOMPRESSED_BYTES: u64 = 256 * 1024 * 1024;
@@ -147,6 +147,57 @@ pub fn validate_extension(path: &Path, expected: ExpectedManifest<'_>) -> RpcRes
         }
     }
     Ok(inspection.manifest)
+}
+
+pub fn validate_extension_directory(root: &Path) -> RpcResult<Manifest> {
+    let files = collect_extension_directory_files(root)?;
+    let names: BTreeSet<_> = files.iter().map(|(path, _)| path.clone()).collect();
+    let manifest_count = names
+        .iter()
+        .filter(|path| path.rsplit('/').next() == Some("package.json"))
+        .count();
+    if manifest_count != 1 {
+        return Err(RpcError::invalid(
+            "INVALID_MANIFEST_COUNT",
+            "package must contain exactly one package.json",
+        ));
+    }
+
+    let manifest_path = files
+        .iter()
+        .find_map(|(path, absolute)| (path == "package.json").then_some(absolute))
+        .ok_or_else(|| {
+            RpcError::invalid(
+                "MANIFEST_NOT_AT_ROOT",
+                "package.json must be at the extension root",
+            )
+        })?;
+
+    for (path, absolute) in &files {
+        reject_native_name(path)?;
+        let data = fs::read(absolute).map_err(RpcError::io)?;
+        reject_native_magic(path, &data)?;
+    }
+
+    let manifest: Manifest =
+        serde_json::from_slice(&fs::read(manifest_path).map_err(RpcError::io)?)
+            .map_err(|error| RpcError::invalid("INVALID_MANIFEST", error.to_string()))?;
+    validate_manifest(&manifest)?;
+    validate_contributions(&manifest, &names)?;
+    Ok(manifest)
+}
+
+pub fn collect_extension_directory_files(root: &Path) -> RpcResult<Vec<(String, PathBuf)>> {
+    let metadata = fs::symlink_metadata(root).map_err(RpcError::io)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(RpcError::invalid(
+            "INVALID_LOCAL_SOURCE",
+            "extension root must be a real directory",
+        ));
+    }
+
+    let ignore = build_ignore_matcher(root)?;
+    collect_local_files(root, &ignore)
 }
 
 pub fn validate_manager_and_stage(
@@ -645,13 +696,7 @@ fn collision_key(path: &str) -> String {
 }
 
 fn validate_manifest(manifest: &Manifest) -> RpcResult<()> {
-    if manifest.name.is_empty()
-        || manifest.name.len() > 128
-        || !manifest
-            .name
-            .chars()
-            .all(|character| character.is_ascii_alphanumeric() || "-._".contains(character))
-    {
+    if !package_id_is_safe(&manifest.name) {
         return Err(RpcError::invalid(
             "INVALID_MANIFEST",
             "manifest name is missing or invalid",
@@ -1558,6 +1603,46 @@ mod tests {
         fs::write(root.join(MANAGER_WINDOWS_HELPER), b"MZwindows").expect("Windows helper");
         fs::write(root.join(MANAGER_LINUX_HELPER), b"\x7fELFlinux").expect("Linux helper");
         copy_test_registry(&root.join("registry"));
+    }
+
+    #[test]
+    fn manifest_names_must_be_safe_portable_cache_ids() {
+        for name in [
+            ".",
+            "..",
+            "CON",
+            "con.json",
+            "PRN",
+            "aux.extension",
+            "NUL",
+            "COM1",
+            "com9.package",
+            "LPT1",
+            "LPT9.extension",
+            "name.",
+        ] {
+            let manifest = Manifest {
+                name: name.to_owned(),
+                version: "1.0.0".to_owned(),
+                display_name: None,
+                main: None,
+                contributes: Value::Null,
+            };
+            let error = validate_manifest(&manifest)
+                .expect_err("unsafe manifest name must be rejected before cache use");
+            assert_eq!(error.code, "INVALID_MANIFEST", "name: {name}");
+        }
+
+        for name in ["console", "COM0", "COM10", "LPT0", "LPT10"] {
+            let manifest = Manifest {
+                name: name.to_owned(),
+                version: "1.0.0".to_owned(),
+                display_name: None,
+                main: None,
+                contributes: Value::Null,
+            };
+            validate_manifest(&manifest).expect("non-device manifest name should remain valid");
+        }
     }
 
     #[test]

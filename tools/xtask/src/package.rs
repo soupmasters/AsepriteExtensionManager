@@ -66,16 +66,22 @@ pub fn create(input: &Path, output: &Path) -> Result<()> {
     validate_directory(input)?;
 
     let manifest = read_manifest(&fs::read(input.join("package.json"))?)?;
+    let name = manifest
+        .get("name")
+        .and_then(Value::as_str)
+        .context("package.json name must be a string")?;
     let version = manifest
         .get("version")
         .and_then(Value::as_str)
         .context("package.json version must be a string")?;
+    let archive_name = archive_filename(name, version)?;
+    let is_manager = name == PACKAGE_NAME;
     let output_path =
         if output.extension().and_then(|value| value.to_str()) == Some("aseprite-extension") {
             output.to_path_buf()
         } else {
             fs::create_dir_all(output).with_context(|| format!("create {}", output.display()))?;
-            output.join(format!("{PACKAGE_NAME}-{version}.aseprite-extension"))
+            output.join(archive_name)
         };
 
     if output_path.exists() {
@@ -85,7 +91,12 @@ pub fn create(input: &Path, output: &Path) -> Result<()> {
         fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     }
 
-    let files = collect_files(input)?;
+    let files = if is_manager {
+        collect_files(input)?
+    } else {
+        aem_helper::package::collect_extension_directory_files(input)
+            .map_err(|error| anyhow::anyhow!("collect extension files failed: {error}"))?
+    };
     let file =
         File::create(&output_path).with_context(|| format!("create {}", output_path.display()))?;
     let mut writer = ZipWriter::new(file);
@@ -119,6 +130,19 @@ pub fn validate(path: &Path) -> Result<()> {
 
 fn validate_directory(root: &Path) -> Result<()> {
     ensure_directory(root, "extension")?;
+    let manifest_bytes = fs::read(root.join("package.json")).context("read package.json")?;
+    let manifest = read_manifest(&manifest_bytes)?;
+    if manifest.get("name").and_then(Value::as_str) == Some(PACKAGE_NAME) {
+        return validate_manager_directory(root);
+    }
+
+    aem_helper::package::validate_extension_directory(root)
+        .map_err(|error| anyhow::anyhow!("runtime extension validation failed: {error}"))?;
+    Ok(())
+}
+
+fn validate_manager_directory(root: &Path) -> Result<()> {
+    ensure_directory(root, "extension")?;
     let files = collect_files(root)?;
     let names: BTreeSet<&str> = files.iter().map(|(name, _)| name.as_str()).collect();
     validate_names(&names)?;
@@ -149,6 +173,76 @@ fn validate_directory(root: &Path) -> Result<()> {
 }
 
 fn validate_archive(path: &Path) -> Result<()> {
+    ensure_file(path, "extension archive")?;
+    let manifest = archive_manifest(path)?;
+    if manifest.get("name").and_then(Value::as_str) == Some(PACKAGE_NAME) {
+        return validate_manager_archive(path);
+    }
+
+    aem_helper::package::validate_extension(path, Default::default())
+        .map_err(|error| anyhow::anyhow!("runtime extension validation failed: {error}"))?;
+    Ok(())
+}
+
+fn archive_manifest(path: &Path) -> Result<Value> {
+    let metadata = fs::metadata(path).with_context(|| format!("inspect {}", path.display()))?;
+    ensure!(
+        metadata.len() <= MAX_ARCHIVE_BYTES,
+        "archive exceeds the size limit"
+    );
+    let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
+    let mut archive = ZipArchive::new(file).context("read extension ZIP")?;
+    ensure!(
+        archive.len() <= MAX_FILE_COUNT,
+        "archive contains more than 4096 entries"
+    );
+    let mut folded = BTreeSet::new();
+    let mut manifest = None;
+    let mut total = 0_u64;
+    for index in 0..archive.len() {
+        let mut entry = archive.by_index(index).context("read ZIP entry")?;
+        let name = normalized_relative(Path::new(entry.name()))?;
+        ensure!(
+            !name.ends_with('/'),
+            "directory ZIP entries are not allowed"
+        );
+        ensure!(
+            folded.insert(name.to_lowercase()),
+            "case-colliding ZIP path: {name}"
+        );
+        ensure!(
+            entry.size() <= MAX_ENTRY_BYTES,
+            "{name} exceeds the per-file size limit"
+        );
+        let compressed = entry.compressed_size();
+        ensure!(
+            entry.size() <= 1024 * 1024
+                || (compressed > 0 && entry.size() / compressed.max(1) <= MAX_COMPRESSION_RATIO),
+            "{name} has an unsafe compression ratio"
+        );
+        total = total
+            .checked_add(entry.size())
+            .context("uncompressed archive size overflow")?;
+        ensure!(
+            total <= MAX_UNCOMPRESSED_BYTES,
+            "uncompressed archive exceeds the size limit"
+        );
+        if name == "package.json" {
+            let mut bytes = Vec::new();
+            entry
+                .read_to_end(&mut bytes)
+                .context("read package.json from archive")?;
+            manifest = Some(bytes);
+        }
+    }
+    read_manifest(
+        manifest
+            .as_deref()
+            .context("archive is missing package.json")?,
+    )
+}
+
+fn validate_manager_archive(path: &Path) -> Result<()> {
     ensure_file(path, "extension archive")?;
     let metadata = fs::metadata(path).with_context(|| format!("inspect {}", path.display()))?;
     ensure!(
@@ -436,6 +530,18 @@ fn read_manifest(bytes: &[u8]) -> Result<Value> {
     serde_json::from_slice(bytes).context("parse package.json")
 }
 
+fn archive_filename(name: &str, version: &str) -> Result<String> {
+    ensure!(
+        !version.trim().is_empty()
+            && !version
+                .chars()
+                .any(|character| character.is_control() || "/\\:<>\"|?*".contains(character))
+            && !version.ends_with(['.', ' ']),
+        "package.json version cannot be used in a portable archive filename"
+    );
+    Ok(format!("{name}-{version}.aseprite-extension"))
+}
+
 fn is_semver(value: &str) -> bool {
     let parts: Vec<_> = value.split('.').collect();
     parts.len() == 3
@@ -561,8 +667,8 @@ mod tests {
     use zip::{write::SimpleFileOptions, ZipArchive, ZipWriter};
 
     use super::{
-        contains_private_registry_material, create, is_consistent_catalog_target, is_semver,
-        normalized_relative, validate,
+        archive_filename, contains_private_registry_material, create, is_consistent_catalog_target,
+        is_semver, normalized_relative, validate,
     };
 
     #[test]
@@ -577,6 +683,27 @@ mod tests {
     fn rejects_parent_path() {
         assert!(normalized_relative(Path::new("../escape")).is_err());
         assert!(normalized_relative(Path::new("/absolute")).is_err());
+    }
+
+    #[test]
+    fn archive_filename_rejects_unsafe_versions() {
+        for version in [
+            "../../../escape",
+            "..\\..\\escape",
+            "version:alternate-stream",
+            "line\nbreak",
+            "trailing.",
+            "trailing ",
+        ] {
+            assert!(
+                archive_filename("sample", version).is_err(),
+                "unsafe version should fail: {version:?}"
+            );
+        }
+        assert_eq!(
+            archive_filename("sample", "1.2.3-beta.1+build").unwrap(),
+            "sample-1.2.3-beta.1+build.aseprite-extension"
+        );
     }
 
     #[test]
@@ -648,6 +775,105 @@ mod tests {
                 & 0o777,
             0o644
         );
+    }
+
+    #[test]
+    fn packages_and_validates_script_only_extensions() {
+        let directory = tempdir().unwrap();
+        let input = directory.path().join("input");
+        fs::create_dir_all(&input).unwrap();
+        fs::write(
+            input.join("package.json"),
+            br#"{
+                "name":"aem-acceptance-fixture",
+                "displayName":"Extension Manager Acceptance Fixture",
+                "version":"1.0.0",
+                "contributes":{"scripts":[{"path":"./fixture.lua"}]}
+            }"#,
+        )
+        .unwrap();
+        fs::write(input.join("fixture.lua"), b"return true\n").unwrap();
+
+        let output = directory.path().join("output");
+        create(&input, &output).unwrap();
+
+        let archive = output.join("aem-acceptance-fixture-1.0.0.aseprite-extension");
+        assert!(archive.is_file());
+        validate(&input).unwrap();
+        validate(&archive).unwrap();
+
+        let file = File::open(archive).unwrap();
+        let mut archive = ZipArchive::new(file).unwrap();
+        assert!(archive.by_name("package.json").is_ok());
+        assert!(archive.by_name("fixture.lua").is_ok());
+        assert!(archive.by_name("main.lua").is_err());
+    }
+
+    #[test]
+    fn generic_packages_honor_local_source_exclusions() {
+        let directory = tempdir().unwrap();
+        let input = directory.path().join("input");
+        fs::create_dir_all(input.join(".git")).unwrap();
+        fs::create_dir_all(input.join("scratch")).unwrap();
+        fs::write(
+            input.join("package.json"),
+            br#"{
+                "name":"aem-acceptance-fixture",
+                "version":"1.0.0",
+                "contributes":{"scripts":[{"path":"./fixture.lua"}]}
+            }"#,
+        )
+        .unwrap();
+        fs::write(input.join("fixture.lua"), b"return true\n").unwrap();
+        fs::write(input.join(".aemignore"), b"ignored.txt\nscratch/\n").unwrap();
+        fs::write(input.join("ignored.txt"), b"must not ship\n").unwrap();
+        fs::write(input.join("scratch/temporary.txt"), b"must not ship\n").unwrap();
+        fs::write(input.join(".git/config"), b"must not ship\n").unwrap();
+        fs::write(input.join(".DS_Store"), b"must not ship\n").unwrap();
+        fs::write(input.join("__info.json"), b"must not ship\n").unwrap();
+
+        let output = directory.path().join("output");
+        create(&input, &output).unwrap();
+
+        let file =
+            File::open(output.join("aem-acceptance-fixture-1.0.0.aseprite-extension")).unwrap();
+        let mut archive = ZipArchive::new(file).unwrap();
+        let names: Vec<_> = (0..archive.len())
+            .map(|index| archive.by_index(index).unwrap().name().to_owned())
+            .collect();
+        assert_eq!(names, vec!["fixture.lua", "package.json"]);
+    }
+
+    #[test]
+    fn script_only_extensions_still_require_their_contributed_files() {
+        let directory = tempdir().unwrap();
+        let input = directory.path().join("input");
+        fs::create_dir_all(&input).unwrap();
+        fs::write(
+            input.join("package.json"),
+            br#"{
+                "name":"aem-acceptance-fixture",
+                "version":"1.0.0",
+                "contributes":{"scripts":[{"path":"./fixture.lua"}]}
+            }"#,
+        )
+        .unwrap();
+
+        let error = validate(&input).unwrap_err();
+        assert!(error.to_string().contains("MISSING_CONTRIBUTION"));
+    }
+
+    #[test]
+    fn manager_packages_still_require_main_lua() {
+        let directory = tempdir().unwrap();
+        let input = directory.path().join("input");
+        create_minimal_tree(&input);
+        fs::remove_file(input.join("main.lua")).unwrap();
+
+        let error = validate(&input).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("missing required file: main.lua"));
     }
 
     #[test]

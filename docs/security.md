@@ -21,11 +21,20 @@ WebSocket permissions. Full or blanket access is not part of the design.
 
 ## Source policy
 
-Version 1 supports public GitHub only. Accepted origins and redirects are
-restricted to GitHub API, archive, and release-asset hosts required by the
-supported operation. Private repositories, credentials, GitHub Enterprise,
-custom registries, install hooks, dependencies, and third-party native code are
-out of scope.
+Version 1 supports public repositories through direct HTTPS and private
+repositories through an installed, signed-in GitHub CLI. Accepted URLs remain
+restricted to canonical `https://github.com/owner/repository` repository,
+tree, and release-asset forms. GitHub Enterprise, credentials in URLs, custom
+registries, install hooks, dependencies, and third-party native code are out
+of scope.
+
+Authenticated access invokes `gh api` directly with fixed arguments. It does
+not run a shell, request or copy an authentication token, or put credentials in
+Lua, RPC messages, receipts, logs, or error text. CLI prompts and update
+notifiers are disabled, command output is bounded, and every command has a hard
+timeout. The downloaded bytes still pass through the same size limits,
+normalization, manifest validation, hashing, and staging used for public
+downloads.
 
 Release resolution prefers one stable `.aseprite-extension` asset. Multiple
 matching assets require explicit selection. Repository branches and tags are
@@ -98,9 +107,23 @@ for public trust. Public signing requirements are in
 
 ## Lifecycle and recovery
 
-The helper never deletes or renames a loaded extension. Install, update, and
-restore all pass through Aseprite's installer prompt. Enable, disable, and
-uninstall hand off to native Extensions preferences.
+Install, update, and restore pass through Aseprite's installer prompt. Enable
+and disable hand off to native Extensions preferences so Aseprite can run the
+extension lifecycle hooks. Aseprite exposes no scripting uninstall command, so
+manager uninstall is explicitly restart-bound. The helper accepts only the
+path, manifest name, and version returned by its own installed scan. It
+canonicalizes the path, requires a real direct child of the active profile's
+extensions directory, re-reads the manifest, and rejects the manager identity
+and canonical manager path. It then atomically moves the complete folder to
+manager-owned recovery storage. Only a uniquely matching receipt is archived
+and removed, and a transaction record reconciles interrupted receipt cleanup
+on the next helper start. No extension files are deleted. Loaded commands can
+remain registered after the move, but resource access and shutdown hooks can
+fail because the original folder is gone. The manager therefore blocks further
+extension changes and requires an immediate Aseprite restart. The lock begins
+when the request is dispatched and survives a closed dialog or lost helper
+connection. It is cleared without a restart only when the helper explicitly
+rejects the request before moving the folder.
 
 Managed receipts are committed only after the installed manifest matches the
 expected name and version. The cache retains current and previous exact
@@ -127,14 +150,17 @@ through the same journaled installation flow.
 
 Cache clearing affects only manager-owned cache files. It does not uninstall
 extensions or remove receipts that represent installed state without a
-separate explicit operation.
+separate explicit operation. Recovery copies from uninstalls are retained.
 
 ## Privacy and diagnostics
 
 There is no telemetry or remote error reporting. Logs and diagnostics remain
 under the active Aseprite profile. Diagnostics omit session tokens and any
-sensitive URL material. Logs rotate and are suitable for explicit user review
-before sharing.
+sensitive URL material. Help can report whether Git and GitHub CLI are
+installed and whether GitHub CLI has an active GitHub login. It exposes only
+booleans and sanitized version text, never executable paths, raw command
+output, or tokens. Logs rotate and are suitable for explicit user review before
+sharing.
 
 ## Distribution gates
 

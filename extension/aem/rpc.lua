@@ -164,7 +164,7 @@ function Rpc:_handle_text(data)
     if type(error_value) ~= "table" then
       error_value = structured_error("helper_error", "The helper returned an error.")
     end
-    pcall(request.onError, error_value)
+    pcall(request.onError, error_value, true)
   end
 end
 

@@ -3,7 +3,8 @@ local expected_version = app.params["version"]
 local extensions_path = app.fs.joinPath(app.fs.userConfigPath, "extensions")
 local matches = {}
 
-for _, directory in ipairs(app.fs.listFiles(extensions_path)) do
+for _, entry in ipairs(app.fs.listFiles(extensions_path)) do
+  local directory = app.fs.joinPath(extensions_path, entry)
   local manifest_path = app.fs.joinPath(directory, "package.json")
   if app.fs.isFile(manifest_path) then
     local file = io.open(manifest_path, "r")

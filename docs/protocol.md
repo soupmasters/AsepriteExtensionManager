@@ -99,8 +99,9 @@ progress to be routed without another mutable identifier.
 | --- | --- |
 | `ping` | Confirm protocol and helper liveness. |
 | `scanInstalled` | Read installed user-extension manifests and join managed receipts. |
+| `uninstallPackage` | Revalidate one exact scanned user extension, move its folder to recovery storage, journal matching-receipt cleanup, and require an Aseprite restart. |
 | `refreshRegistry` | Refresh and authenticate catalog metadata, or load last-known-good cache. |
-| `resolveGitHub` | Resolve a supported public GitHub URL to explicit candidates or immutable source. |
+| `resolveGitHub` | Resolve a supported public or authenticated private GitHub URL to explicit candidates or immutable source. |
 | `preparePackage` | Download, validate, normalize, hash, stage, and cache a resolved artifact. |
 | `prepareSelfUpdate` | With `{}`, prepare a newer manager release from the canonical repository together with a recovery archive and pending journal. |
 | `prepareSelfRollback` | With `{}`, prepare the manager's verified previous release through the same recovery-safe transaction. |
@@ -110,15 +111,23 @@ progress to be routed without another mutable identifier.
 | `prepareRollback` | With `{ "name": "<manifest name>" }`, return the previously cached artifact after validating it again. |
 | `cacheStatus` | Report current and previous cache entries and byte counts. |
 | `clearCache` | With `{ "preserveRestorePoints": true }` by default, clear disposable cache data without removing restore artifacts. |
-| `diagnostics` | Return local version, paths, protocol, and non-sensitive health information. |
+| `diagnostics` | Return local version, protocol, tool availability, and non-sensitive health information. |
 | `shutdown` | End the authenticated session. |
 
-`resolveGitHub` accepts only supported public GitHub forms. If a stable release
-contains multiple matching extension assets, its result contains candidates
-and requires a new user-confirmed request. Repository snapshots record both the
-tracked ref and its resolved commit SHA. A later check resolves the ref again;
-changed snapshot bytes can be an update even when the manifest version is the
-same.
+`resolveGitHub` accepts only canonical GitHub repository, tree, and release
+asset forms. It tries the restricted public HTTPS transport first. When GitHub
+reports that a source is not publicly available, the helper can retry through
+an installed, signed-in `gh` command without moving credentials into the RPC
+protocol. If a stable release contains multiple matching extension assets, its
+result contains candidates and requires a new user-confirmed request.
+Repository snapshots record both the tracked ref and its resolved commit SHA.
+A later check resolves the ref again through the same flow; changed snapshot
+bytes can be an update even when the manifest version is the same.
+
+`diagnostics` includes structured Git and GitHub CLI status used by Help. A
+tool check is noninteractive and time-bounded. Authentication status is a
+boolean from a silent `gh api user` readiness probe; tokens and raw CLI output
+are never returned.
 
 `syncLocal` is rooted at the folder containing the user-selected
 `package.json`. It reads that tree only, honors `.aemignore`, skips fixed manager

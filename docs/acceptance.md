@@ -13,8 +13,9 @@ The following must pass on the exact branch commit under test:
 - fake-Aseprite Lua tests;
 - TUF metadata regeneration, signature chain, expiry, rollback, freeze,
   corruption, and offline-cache cases;
-- GitHub URL, stable release, ambiguous asset, immutable commit, ETag, and rate
-  limit cases, including explicit per-package update errors;
+- GitHub URL, stable release, ambiguous asset, immutable commit, ETag, rate
+  limit, fixed `gh` arguments, missing CLI, signed-out CLI, and CLI error mapping,
+  including explicit per-package update errors;
 - malicious ZIP, path collision, Unicode and space-heavy names, limits,
   interrupted download, atomic receipt, eviction, and restore cases;
 - local-folder exclusion, `.aemignore`, snapshot normalization, and repeated
@@ -31,7 +32,7 @@ The following must pass on the exact branch commit under test:
 
 ## Isolated macOS setup
 
-Use Aseprite 1.3.18.1 and an empty temporary profile:
+Use Aseprite 1.3.18.3 and an empty temporary profile:
 
 ```sh
 export AEM_ACCEPTANCE_PROFILE="$(mktemp -d)"
@@ -55,7 +56,8 @@ profile for destructive failure simulations.
    Confirm both exact source hashes are authenticated, the snapshot records its
    immutable commit, and each installed receipt records the correct source.
 5. Install a direct release-style fixture. Exercise the multiple-asset chooser
-   and cancel once before selecting explicitly.
+   and cancel once before selecting explicitly. Open Help and confirm Git and
+   GitHub CLI availability are reported without opening a terminal.
 6. Update between two fixture versions. Confirm extension preferences survive,
    installed name/version verification succeeds, and current/previous cache
    artifacts are exact.
@@ -72,35 +74,48 @@ profile for destructive failure simulations.
     keeping the manifest version unchanged, and refresh. Confirm changed
     snapshot bytes are offered once, while identical bytes and downgrades are
     not.
-11. Make one linked source unavailable and make another fail validation.
+11. Sign in with GitHub CLI and install one private repository, testing both a
+    release asset and a repository snapshot when available. Advance its saved
+    release or tracked ref and confirm the update is found. Sign out or hide the
+    CLI and confirm the package receives a clear update error without losing its
+    managed receipt.
+12. Make one linked source unavailable and make another fail validation.
     Confirm each package displays its update error, other update checks still
     complete, and neither failure is presented as "up to date."
-12. Use enable, disable, and uninstall actions. Confirm they open native
-    Extensions preferences and the manager rescans after returning.
-13. Trigger one managed update and verify the startup check runs no more than
+13. Confirm enable and disable open native Extensions preferences. Uninstall a
+    managed extension and a manually copied extension without `__info.json`.
+    Confirm each disappears from the manager, its exact folder is moved to
+    recovery storage, a uniquely matching receipt is archived, its source
+    folder is untouched, and Aseprite requests an immediate restart. Before
+    restarting, confirm further install, update, restore, and uninstall actions
+    are blocked. Repeat once while closing the manager before the helper replies,
+    then reopen it and confirm the restart lock remains. Confirm uninstall cannot
+    start during a refresh. Confirm the manager itself has no uninstall action
+    and the helper rejects a direct manager uninstall request.
+14. Trigger one managed update and verify the startup check runs no more than
     once in 24 hours. Confirm an update uses an eight-second status tip while
     success and transient network failure remain silent.
-14. In the isolated profile, start from the previous stable manager release and
+15. In the isolated profile, start from the previous stable manager release and
     update to the newer stable release published by the canonical repository.
     Confirm the UI requires explicit approval, the recovery archive and pending
     journal exist outside the installed extension, the helper exits before
     Aseprite installs the candidate, and the UI requires an Aseprite restart.
-15. Restart Aseprite and open the manager. Confirm the new helper reconciles the
+16. Restart Aseprite and open the manager. Confirm the new helper reconciles the
     pending transaction, validates the installed tree and saved hashes, writes
     current/previous manager cache entries and a receipt, and removes the
     pending files. Then explicitly restore the previous manager release and
     repeat the restart/reconciliation check.
-16. Repeat the manager update once with installation cancelled and confirm the
+17. Repeat the manager update once with installation cancelled and confirm the
     intact old installation clears the pending transaction. In a disposable
     copy of the isolated profile, simulate an incomplete replacement and a
     changed recovery archive; confirm `SELF_UPDATE_RECOVERY_REQUIRED` is shown
     and the recovery archive is retained.
-17. Disconnect networking. Confirm installed/cache state remains usable,
+18. Disconnect networking. Confirm installed/cache state remains usable,
     expired catalog data cannot authorize a catalog operation, and direct local
     sync remains available.
-18. Close and reopen the dialog, restart Aseprite, and verify receipts,
+19. Close and reopen the dialog, restart Aseprite, and verify receipts,
     preferences, and cache state persist under the isolated profile.
-19. Confirm `shutdown`, dialog close, disconnect, and idle timeout leave no
+20. Confirm `shutdown`, dialog close, disconnect, and idle timeout leave no
     helper process listening.
 
 ## Completion record

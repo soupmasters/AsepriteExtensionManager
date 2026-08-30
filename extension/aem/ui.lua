@@ -11,6 +11,8 @@ local REPOSITORY_LINK_HEIGHT = 16
 local LEFT_MOUSE_BUTTON = MouseButton and MouseButton.LEFT or 1
 local POINTER_CURSOR = MouseCursor and MouseCursor.POINTER or nil
 local RESIZE_DEBOUNCE_SECONDS = 0.1
+local DEFAULT_MANAGER_WIDTH = 720
+local MANAGER_WINDOW_MARGIN = 16
 local FALLBACK_INLINE_WIDTH = 560
 local WIDTH_PRESERVING_AUTOFIT = Align and Align.TOP or 0
 local VIEW_OPTIONS = {
@@ -54,6 +56,34 @@ local function manager_version(plugin)
     return "Unknown"
   end
   return tostring(value)
+end
+
+local function installed_tool_status(tool)
+  if type(tool) ~= "table" or type(tool.installed) ~= "boolean" then
+    return "? Unknown"
+  end
+  if not tool.installed then
+    return "✕ Not installed"
+  end
+  local status = "✓ Installed"
+  if type(tool.version) == "string" and tool.version ~= "" then
+    status = status .. " · " .. tool.version
+  end
+  return status
+end
+
+local function github_cli_status(tool)
+  local status = installed_tool_status(tool)
+  if type(tool) ~= "table" or tool.installed ~= true then
+    return status
+  end
+  if tool.authenticated == true then
+    return status .. " · ✓ Signed in"
+  end
+  if tool.authenticated == false then
+    return status .. " · ✕ Sign-in unavailable"
+  end
+  return status .. " · ? Sign-in unknown"
 end
 
 local function fallback_link_color()
@@ -233,6 +263,80 @@ local function dialog_dimension(dialog, property, dimension)
   return value
 end
 
+local function object_dimension(object, dimension)
+  local ok, value = pcall(function()
+    return object and object[dimension]
+  end)
+  if not ok then
+    return nil
+  end
+  value = tonumber(value)
+  if not value or value <= 0 then
+    return nil
+  end
+  return value
+end
+
+local function ui_scale(app_instance)
+  return math.max(1, tonumber(app_instance and app_instance.uiScale) or 1)
+end
+
+local function manager_show_bounds(dialog, app_instance, rectangle_constructor)
+  local current_width = dialog_dimension(dialog, "bounds", "width")
+    or dialog_dimension(dialog, "sizeHint", "width")
+  local current_height = dialog_dimension(dialog, "bounds", "height")
+    or dialog_dimension(dialog, "sizeHint", "height")
+  if not current_width or not current_height then
+    return nil
+  end
+
+  local window = app_instance and app_instance.window
+  local window_width = object_dimension(window, "width")
+  local scale = ui_scale(app_instance)
+  local margin = MANAGER_WINDOW_MARGIN * scale
+  local target_width = math.max(current_width, DEFAULT_MANAGER_WIDTH * scale)
+  if window_width then
+    target_width = math.min(
+      target_width,
+      math.max(1, window_width - margin * 2)
+    )
+  end
+
+  local ok, current = pcall(function()
+    return dialog.bounds
+  end)
+  current = ok and current or nil
+  local current_x = tonumber(current and current.x)
+  local current_y = tonumber(current and current.y) or 0
+  local target_x = current_x
+  if target_x then
+    target_x = target_x - math.floor((target_width - current_width) / 2)
+  end
+  if window_width then
+    if not target_x or target_x <= 0 then
+      target_x = math.floor((window_width - target_width) / 2)
+    end
+    local maximum_x = math.max(
+      margin,
+      window_width - target_width - margin
+    )
+    target_x = math.max(margin, math.min(target_x, maximum_x))
+  else
+    target_x = math.max(0, target_x or 0)
+  end
+
+  local bounds = {
+    x = target_x,
+    y = current_y,
+    width = target_width,
+    height = current_height,
+  }
+  if type(rectangle_constructor) == "function" then
+    return rectangle_constructor(bounds.x, bounds.y, bounds.width, bounds.height)
+  end
+  return bounds
+end
+
 local function option_labels(options)
   local labels = {}
   for index, option in ipairs(options) do
@@ -267,6 +371,7 @@ end
 
 local function add_view_controls(ui, dialog, kind, supports_same_row)
   local options = VIEW_OPTIONS[kind]
+  local active = ui:_is_active_view(kind)
 
   local function add_combobox(field, id, visible, expand)
     local choices = options[field]
@@ -293,12 +398,12 @@ local function add_view_controls(ui, dialog, kind, supports_same_row)
 
   if supports_same_row then
     dialog:samerow()
-    add_combobox("filter", kind .. "_filter", true, false)
+    add_combobox("filter", kind .. "_filter", active, false)
     dialog:samerow()
-    add_combobox("sort", kind .. "_sort", true, false)
+    add_combobox("sort", kind .. "_sort", active, false)
   else
-    add_combobox("filter", kind .. "_filter", true, true)
-    add_combobox("sort", kind .. "_sort", true, true)
+    add_combobox("filter", kind .. "_filter", active, true)
+    add_combobox("sort", kind .. "_sort", active, true)
   end
   dialog:newrow()
 
@@ -310,7 +415,33 @@ local function add_view_controls(ui, dialog, kind, supports_same_row)
   end
 end
 
+local function add_search_control(ui, dialog, kind, supports_same_row)
+  local id = kind .. "_search"
+  local active = ui:_is_active_view(kind)
+  if supports_same_row then
+    dialog:label {
+      id = kind .. "_search_label",
+      text = "Search:",
+      hexpand = false,
+      visible = active,
+    }
+    dialog:samerow()
+  end
+  dialog:entry {
+    id = id,
+    label = not supports_same_row and "Search:" or nil,
+    text = kind == "browse" and ui.model.browseSearch or ui.model.installedSearch,
+    hexpand = true,
+    visible = active,
+    onchange = function()
+      ui.model:set_search(kind, dialog.data[id])
+      ui:refresh()
+    end,
+  }
+end
+
 local function add_pager(ui, dialog, kind, supports_same_row)
+  local active = ui:_is_active_view(kind)
   local function stay_on_row()
     if supports_same_row then
       dialog:samerow()
@@ -322,6 +453,7 @@ local function add_pager(ui, dialog, kind, supports_same_row)
       id = kind .. "_pager_left_spacer",
       text = "",
       hexpand = true,
+      visible = active,
     }
     stay_on_row()
   end
@@ -330,6 +462,7 @@ local function add_pager(ui, dialog, kind, supports_same_row)
     text = "←",
     focus = false,
     hexpand = false,
+    visible = active,
     onclick = function()
       ui.model:move_page(kind, -1)
       ui:refresh()
@@ -341,6 +474,7 @@ local function add_pager(ui, dialog, kind, supports_same_row)
       id = kind .. "_page",
       text = "1 / 1",
       hexpand = false,
+      visible = active,
     }
   else
     dialog:button {
@@ -349,6 +483,7 @@ local function add_pager(ui, dialog, kind, supports_same_row)
       enabled = false,
       focus = false,
       hexpand = false,
+      visible = active,
     }
   end
   stay_on_row()
@@ -357,6 +492,7 @@ local function add_pager(ui, dialog, kind, supports_same_row)
     text = "→",
     focus = false,
     hexpand = false,
+    visible = active,
     onclick = function()
       ui.model:move_page(kind, 1)
       ui:refresh()
@@ -368,36 +504,51 @@ local function add_pager(ui, dialog, kind, supports_same_row)
       id = kind .. "_pager_right_spacer",
       text = "",
       hexpand = true,
+      visible = active,
     }
   end
 end
 
-local function update_pager(dialog, kind, page, pages, busy, supports_same_row)
-  local visible = pages > 1
-  dialog:modify {
+local function update_pager(
+  dialog,
+  kind,
+  page,
+  pages,
+  busy,
+  supports_same_row,
+  update_visibility
+)
+  local active = update_visibility == true
+  local visible = true
+  local page_update = {
     id = kind .. "_page",
     text = tostring(page) .. " / " .. tostring(pages),
-    visible = visible,
+    visible = active and visible,
   }
-  dialog:modify {
+  local previous_update = {
     id = kind .. "_previous",
-    visible = visible,
     enabled = visible and page > 1 and not busy,
+    visible = active and visible,
   }
-  dialog:modify {
+  local next_update = {
     id = kind .. "_next",
-    visible = visible,
     enabled = visible and page < pages and not busy,
+    visible = active and visible,
   }
+  dialog:modify(page_update)
+  dialog:modify(previous_update)
+  dialog:modify(next_update)
   if supports_same_row then
-    dialog:modify {
+    local left_spacer_update = {
       id = kind .. "_pager_left_spacer",
-      visible = visible,
+      visible = active and visible,
     }
-    dialog:modify {
+    local right_spacer_update = {
       id = kind .. "_pager_right_spacer",
-      visible = visible,
+      visible = active and visible,
     }
+    dialog:modify(left_spacer_update)
+    dialog:modify(right_spacer_update)
   end
 end
 
@@ -458,6 +609,7 @@ function Ui.new(environment, model)
     wideRowMinWidth = nil,
     layoutTimer = nil,
     pendingLayoutWidth = nil,
+    activeView = "browse",
   }, Ui)
 end
 
@@ -477,19 +629,14 @@ function Ui:_stop_layout_timer()
 end
 
 function Ui:_fallback_inline_width()
-  local scale = tonumber(self.app and self.app.uiScale) or 1
-  return FALLBACK_INLINE_WIDTH * math.max(1, scale)
+  return FALLBACK_INLINE_WIDTH * ui_scale(self.app)
 end
 
 function Ui:_capture_wide_row_width()
   if not self.supportsSameRow or self.rowsStacked or not self.dialog then
     return
   end
-  local candidate = math.max(
-    dialog_dimension(self.dialog, "sizeHint", "width") or 0,
-    self:_fallback_inline_width()
-  )
-  self.wideRowMinWidth = math.max(self.wideRowMinWidth or 0, candidate)
+  self.wideRowMinWidth = self:_fallback_inline_width()
 end
 
 function Ui:_row_package(kind, index)
@@ -515,6 +662,44 @@ function Ui:_row_text(kind, package)
   return installed_row(package)
 end
 
+function Ui:_is_active_view(kind)
+  return self.activeView == kind
+end
+
+function Ui:_activate_tab(tab)
+  local kind
+  if tab == "browse_tab" then
+    kind = "browse"
+  elseif tab == "installed_tab" then
+    kind = "installed"
+  end
+  if not kind or self.activeView == kind then
+    return
+  end
+  self.activeView = kind
+  if self.responsiveReady then
+    self:refresh()
+  end
+end
+
+function Ui:_update_search_control(kind)
+  local dialog = self.dialog
+  if not dialog then
+    return
+  end
+  local active = self:_is_active_view(kind)
+  if self.supportsSameRow then
+    dialog:modify {
+      id = kind .. "_search_label",
+      visible = active,
+    }
+  end
+  dialog:modify {
+    id = kind .. "_search",
+    visible = active,
+  }
+end
+
 function Ui:_update_row_controls(kind, index)
   local dialog = self.dialog
   if not dialog then
@@ -523,22 +708,36 @@ function Ui:_update_row_controls(kind, index)
   local package = self:_row_package(kind, index)
   local present = package ~= nil
   local stacked = self.supportsSameRow and self.rowsStacked
-  dialog:modify {
+  local active = self:_is_active_view(kind)
+  if not self.supportsSameRow then
+    local details_update = {
+      id = kind .. "_details_" .. tostring(index),
+      label = self:_row_text(kind, package),
+      enabled = not self.model.busy,
+      visible = active and present,
+    }
+    dialog:modify(details_update)
+    return
+  end
+  local row_update = {
     id = kind .. "_row_" .. tostring(index),
     text = self:_row_text(kind, package),
-    visible = present,
+    visible = active and present,
   }
-  dialog:modify {
+  local details_update = {
     id = kind .. "_details_" .. tostring(index),
-    visible = present and not stacked,
     enabled = not self.model.busy,
+    visible = active and present and not stacked,
   }
+  dialog:modify(row_update)
+  dialog:modify(details_update)
   if self.supportsSameRow then
-    dialog:modify {
+    local stacked_details_update = {
       id = kind .. "_stacked_details_" .. tostring(index),
-      visible = present and stacked,
       enabled = not self.model.busy,
+      visible = active and present and stacked,
     }
+    dialog:modify(stacked_details_update)
   end
 end
 
@@ -548,19 +747,23 @@ function Ui:_update_view_controls(kind)
     return
   end
   local options = VIEW_OPTIONS[kind]
+  local stacked = self.supportsSameRow and self.rowsStacked
+  local active = self:_is_active_view(kind)
   for _, field in ipairs({ "filter", "sort" }) do
     local selected = option_label(options[field], view_value(self.model, kind, field))
-    dialog:modify {
+    local inline_update = {
       id = kind .. "_" .. field,
       option = selected,
-      visible = true,
+      visible = active and not stacked,
     }
+    dialog:modify(inline_update)
     if self.supportsSameRow then
-      dialog:modify {
+      local stacked_update = {
         id = kind .. "_stacked_" .. field,
         option = selected,
-        visible = false,
+        visible = active and stacked,
       }
+      dialog:modify(stacked_update)
     end
   end
 end
@@ -628,8 +831,11 @@ function Ui:_schedule_row_layout(dialog)
       self.layoutTimer = nil
       local pending_width = self.pendingLayoutWidth
       self.pendingLayoutWidth = nil
-      if self.dialog == dialog and pending_width then
-        self:_apply_layout_width(pending_width)
+      if self.dialog == dialog then
+        local final_width = dialog_dimension(dialog, "bounds", "width") or pending_width
+        if final_width then
+          self:_apply_layout_width(final_width)
+        end
       end
     end,
   }
@@ -652,7 +858,7 @@ function Ui:show_onboarding()
   }
   dialog:separator { text = "Private Alpha" }
   dialog:label {
-    text = "Install public GitHub extensions and link local development folders.",
+    text = "Install public or private GitHub extensions and link local development folders.",
   }
   dialog:separator { text = "Permissions" }
   dialog:label {
@@ -701,21 +907,13 @@ function Ui:_build()
   self.supportsSameRow = type(dialog.samerow) == "function"
   self.rowsStacked = false
   self.wideRowMinWidth = nil
+  self.activeView = "browse"
 
   dialog:tab {
     id = "browse_tab",
     text = "Browse",
   }
-  dialog:entry {
-    id = "browse_search",
-    label = "Search:",
-    text = self.model.browseSearch,
-    hexpand = true,
-    onchange = function()
-      self.model:set_search("browse", dialog.data.browse_search)
-      self:refresh()
-    end,
-  }
+  add_search_control(self, dialog, "browse", self.supportsSameRow)
   add_view_controls(self, dialog, "browse", self.supportsSameRow)
   dialog:label {
     id = "browse_empty",
@@ -724,17 +922,18 @@ function Ui:_build()
   }
   for index = 1, self.model.pageSize do
     local row_index = index
-    dialog:label {
-      id = "browse_row_" .. tostring(index),
-      text = "",
-      visible = false,
-      hexpand = true,
-    }
     if self.supportsSameRow then
+      dialog:label {
+        id = "browse_row_" .. tostring(index),
+        text = "",
+        visible = false,
+        hexpand = true,
+      }
       dialog:samerow()
     end
     dialog:button {
       id = "browse_details_" .. tostring(index),
+      label = not self.supportsSameRow and "" or nil,
       text = "Details",
       visible = false,
       hexpand = false,
@@ -768,16 +967,7 @@ function Ui:_build()
     id = "installed_tab",
     text = "Installed",
   }
-  dialog:entry {
-    id = "installed_search",
-    label = "Search:",
-    text = self.model.installedSearch,
-    hexpand = true,
-    onchange = function()
-      self.model:set_search("installed", dialog.data.installed_search)
-      self:refresh()
-    end,
-  }
+  add_search_control(self, dialog, "installed", self.supportsSameRow)
   add_view_controls(self, dialog, "installed", self.supportsSameRow)
   dialog:label {
     id = "installed_empty",
@@ -786,17 +976,18 @@ function Ui:_build()
   }
   for index = 1, self.model.pageSize do
     local row_index = index
-    dialog:label {
-      id = "installed_row_" .. tostring(index),
-      text = "",
-      visible = false,
-      hexpand = true,
-    }
     if self.supportsSameRow then
+      dialog:label {
+        id = "installed_row_" .. tostring(index),
+        text = "",
+        visible = false,
+        hexpand = true,
+      }
       dialog:samerow()
     end
     dialog:button {
       id = "installed_details_" .. tostring(index),
+      label = not self.supportsSameRow and "" or nil,
       text = "Details",
       visible = false,
       hexpand = false,
@@ -830,6 +1021,9 @@ function Ui:_build()
     selected = "browse_tab",
     hexpand = true,
     vexpand = true,
+    onchange = function(event)
+      self:_activate_tab(event and event.tab)
+    end,
   }
 
   dialog:separator {}
@@ -927,6 +1121,16 @@ function Ui:open(controller)
   show_responsive(self.dialog, {
     wait = false,
   })
+  local bounds = manager_show_bounds(
+    self.dialog,
+    self.app,
+    self.environment.Rectangle
+  )
+  if bounds then
+    pcall(function()
+      self.dialog.bounds = bounds
+    end)
+  end
   pcall(function()
     self.dialog.autofit = WIDTH_PRESERVING_AUTOFIT
   end)
@@ -985,8 +1189,9 @@ function Ui:refresh()
   dialog:modify {
     id = "browse_empty",
     text = empty_message,
-    visible = empty_message ~= "",
+    visible = self:_is_active_view("browse") and empty_message ~= "",
   }
+  self:_update_search_control("browse")
   self:_update_view_controls("browse")
   for index = 1, self.model.pageSize do
     self:_update_row_controls("browse", index)
@@ -997,7 +1202,8 @@ function Ui:refresh()
     browse_page,
     browse_pages,
     self.model.busy,
-    self.supportsSameRow
+    self.supportsSameRow,
+    self:_is_active_view("browse")
   )
 
   local installed, installed_page, installed_pages, installed_count = self.model:page("installed")
@@ -1018,8 +1224,9 @@ function Ui:refresh()
   dialog:modify {
     id = "installed_empty",
     text = installed_empty_message,
-    visible = installed_empty,
+    visible = self:_is_active_view("installed") and installed_empty,
   }
+  self:_update_search_control("installed")
   self:_update_view_controls("installed")
   for index = 1, self.model.pageSize do
     self:_update_row_controls("installed", index)
@@ -1030,7 +1237,8 @@ function Ui:refresh()
     installed_page,
     installed_pages,
     self.model.busy,
-    self.supportsSameRow
+    self.supportsSameRow,
+    self:_is_active_view("installed")
   )
 
   local manager_update = self_update_available(self.model.managerPackage)
@@ -1197,7 +1405,8 @@ function Ui:prompt_github_url()
     resizeable = true,
   }
   dialog:label {
-    text = "Enter a public GitHub repository URL or",
+    id = "github_prompt_source",
+    text = "Enter a public or private GitHub repository URL or",
   }
   dialog:label {
     text = "an .aseprite-extension release URL.",
@@ -1313,10 +1522,19 @@ function Ui:prompt_package_json()
 end
 
 function Ui:show_help()
+  local help_open = true
+  local diagnostics_ticket
   local dialog = self.environment.Dialog {
     title = "About Aseprite Extension Manager",
     parent = self:_parent(),
     resizeable = true,
+    onclose = function()
+      help_open = false
+      if diagnostics_ticket then
+        diagnostics_ticket.cancel()
+        diagnostics_ticket = nil
+      end
+    end,
   }
   dialog:label {
     id = "help_version",
@@ -1370,6 +1588,17 @@ function Ui:show_help()
       }
     end)
   end
+  dialog:separator { text = "Command Line Tools" }
+  dialog:label {
+    id = "help_git",
+    label = "Git:",
+    text = "? Checking…",
+  }
+  dialog:label {
+    id = "help_gh",
+    label = "GitHub CLI:",
+    text = "? Checking…",
+  }
   local manager = self.model.managerPackage
   if manager then
     dialog:separator { text = "Manager Updates" }
@@ -1424,6 +1653,37 @@ function Ui:show_help()
         end,
       }
     end
+  end
+
+  local function update_tool_status(result, error_value)
+    if not help_open then
+      return
+    end
+    local tools = type(result) == "table" and result.tools or nil
+    local git_status = "? Could not check"
+    local gh_status = "? Could not check"
+    if error_value == nil and type(tools) == "table" then
+      git_status = installed_tool_status(tools.git)
+      gh_status = github_cli_status(tools.gh)
+    end
+    pcall(function()
+      dialog:modify {
+        id = "help_git",
+        text = git_status,
+      }
+      dialog:modify {
+        id = "help_gh",
+        text = gh_status,
+      }
+    end)
+  end
+  if self.controller and type(self.controller.request_diagnostics) == "function" then
+    diagnostics_ticket = self.controller:request_diagnostics(update_tool_status)
+    if not diagnostics_ticket then
+      update_tool_status(nil, true)
+    end
+  else
+    update_tool_status(nil, true)
   end
   show_responsive(dialog)
 end
@@ -1579,8 +1839,9 @@ function Ui:show_package_details(package, kind)
       dialog:button {
         text = "Uninstall…",
         onclick = function()
-          dialog:close()
-          self.controller:open_native_extension_preferences("uninstall", package)
+          if self.controller:uninstall_package(package) then
+            dialog:close()
+          end
         end,
       }
     end

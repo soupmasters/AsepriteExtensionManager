@@ -46,6 +46,10 @@ function Fakes.app(options)
     version = options.version or "1.3.15",
     uiScale = options.uiScale or 1,
     isUIAvailable = options.isUIAvailable ~= false,
+    window = options.window == false and nil or (options.window or {
+      width = options.windowWidth or 1280,
+      height = options.windowHeight or 800,
+    }),
     os = options.os or {
       name = "macOS",
       macos = true,
@@ -139,7 +143,7 @@ function Fakes.rpc()
     self.requests[index].callbacks.onError(error_value or {
       code = "test_error",
       message = "Test error",
-    })
+    }, true)
   end
 
   function rpc:progress(index, progress)
@@ -310,11 +314,12 @@ function Fakes.dialog_factory(factory_options)
       widgets = {},
       widgetsById = {},
       sameRowCalls = {},
+      modifyCalls = {},
       data = {},
       bounds = {
         x = 0,
         y = 0,
-        width = options.width or 744,
+        width = options.width or factory_options.boundsWidth or 744,
         height = options.height or 484,
       },
       sizeHint = {
@@ -378,10 +383,32 @@ function Fakes.dialog_factory(factory_options)
     end
 
     function dialog:endtabs(definition)
+      if definition and definition.id then
+        self.data[definition.id] = definition.selected
+      end
       return widget("endtabs", definition)
     end
 
+    function dialog:selectTab(group_id, tab_id)
+      local group = self.widgetsById[group_id]
+      if not group or group.kind ~= "endtabs" then
+        error("unknown tabs group: " .. tostring(group_id))
+      end
+      self.data[group_id] = tab_id
+      if group.definition.onchange then
+        group.definition.onchange {
+          tab = tab_id,
+        }
+      end
+      return self
+    end
+
     function dialog:modify(definition)
+      local call = {}
+      for key, value in pairs(definition) do
+        call[key] = value
+      end
+      self.modifyCalls[#self.modifyCalls + 1] = call
       local existing = definition.id and self.widgetsById[definition.id]
       if existing then
         for key, value in pairs(definition) do
@@ -396,6 +423,14 @@ function Fakes.dialog_factory(factory_options)
 
     function dialog:show(show_options)
       self.shown = show_options or true
+      if type(show_options) == "table" and show_options.bounds ~= nil then
+        self.bounds = {
+          x = show_options.bounds.x,
+          y = show_options.bounds.y,
+          width = show_options.bounds.width,
+          height = show_options.bounds.height,
+        }
+      end
       if factory_options.shrinkSizeHintOnShow then
         self.sizeHint.width = factory_options.shrinkSizeHintOnShow
       end

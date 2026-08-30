@@ -193,3 +193,32 @@ Test.case("cancelled RPC requests ignore later responses", function()
   socket:emit("text", "RESPONSE")
   Test.falsy(called)
 end)
+
+Test.case("RPC marks explicit helper rejections as definitive", function()
+  local environment, json_api, socket_value = rpc_environment()
+  local rpc = Rpc.new(environment)
+  local definitive
+  local received_error
+  rpc:request("scanInstalled", {}, {
+    onError = function(error_value, helper_rejected)
+      received_error = error_value
+      definitive = helper_rejected
+    end,
+  })
+  local socket = socket_value()
+  local request = json_api.value(socket.sent[1])
+  json_api.register("HELPER_ERROR", {
+    protocol = 1,
+    id = request.id,
+    ok = false,
+    error = {
+      code = "INVALID_EXTENSION_PATH",
+      message = "The extension path is invalid.",
+    },
+  })
+
+  socket:emit("text", "HELPER_ERROR")
+
+  Test.truthy(definitive)
+  Test.equal(received_error.code, "INVALID_EXTENSION_PATH")
+end)

@@ -298,6 +298,24 @@ Test.case("manager uses compact native install and utility controls", function()
     refresh = function() end,
     install_from_github = function() end,
     sync_local_folder = function() end,
+    request_diagnostics = function(_, callback)
+      callback({
+        tools = {
+          git = {
+            installed = true,
+            version = "2.45.0",
+          },
+          gh = {
+            installed = true,
+            version = "2.50.0",
+            authenticated = true,
+          },
+        },
+      })
+      return {
+        cancel = function() end,
+      }
+    end,
     on_dialog_closed = function() end,
   }
   ui:open(controller)
@@ -309,6 +327,7 @@ Test.case("manager uses compact native install and utility controls", function()
   Test.equal(type(manager.shown), "table")
   Test.equal(manager.shown.wait, false)
   Test.truthy(manager.shown.autoscrollbars)
+  Test.truthy(manager.bounds.width >= 720)
 
   local buttons = {}
   local widget_indices = {}
@@ -358,6 +377,14 @@ Test.case("manager uses compact native install and utility controls", function()
     "Martin Calander · Soupmasters"
   )
   Test.equal(help_dialog.widgetsById.help_license.definition.text, "MIT License")
+  Test.equal(
+    help_dialog.widgetsById.help_git.definition.text,
+    "✓ Installed · 2.45.0"
+  )
+  Test.equal(
+    help_dialog.widgetsById.help_gh.definition.text,
+    "✓ Installed · 2.50.0 · ✓ Signed in"
+  )
   local repository_link = help_dialog.widgetsById.help_repository
   Test.equal(repository_link.kind, "canvas")
   Test.equal(repository_link.definition.label, "Repository:")
@@ -466,6 +493,10 @@ Test.case("manager uses compact native install and utility controls", function()
   Test.equal(preferences_dialog.widgetsById.cancel_preferences.definition.text, "Discard")
 
   for _, kind in ipairs({ "browse", "installed" }) do
+    Test.equal(manager.widgetsById[kind .. "_search_label"].kind, "label")
+    Test.equal(manager.widgetsById[kind .. "_search_label"].definition.text, "Search:")
+    Test.falsy(manager.widgetsById[kind .. "_search"].definition.label)
+    Test.truthy(same_row_after[kind .. "_search_label"])
     for index = 1, model.pageSize do
       local row_id = kind .. "_row_" .. tostring(index)
       local details_id = kind .. "_details_" .. tostring(index)
@@ -488,18 +519,91 @@ Test.case("manager uses compact native install and utility controls", function()
   end
 
   for _, kind in ipairs({ "browse", "installed" }) do
+    manager:selectTab("manager_tabs", kind .. "_tab")
     local previous = manager.widgetsById[kind .. "_previous"].definition
     local page = manager.widgetsById[kind .. "_page"].definition
     local next_page = manager.widgetsById[kind .. "_next"].definition
     Test.equal(previous.text, "←")
     Test.equal(page.text, "1 / 1")
     Test.equal(next_page.text, "→")
-    Test.falsy(previous.visible)
-    Test.falsy(page.visible)
-    Test.falsy(next_page.visible)
+    Test.truthy(previous.visible)
+    Test.truthy(page.visible)
+    Test.truthy(next_page.visible)
+    Test.falsy(previous.enabled)
+    Test.falsy(next_page.enabled)
     Test.truthy(widget_indices[kind .. "_previous"] < widget_indices[kind .. "_page"])
     Test.truthy(widget_indices[kind .. "_page"] < widget_indices[kind .. "_next"])
   end
+end)
+
+Test.case("help reports missing tools and ignores diagnostics after close", function()
+  local app = Fakes.app {
+    allFilesExist = true,
+  }
+  local Dialog, dialogs = Fakes.dialog_factory()
+  local ui = Ui.new({
+    app = app,
+    plugin = Fakes.plugin(),
+    Dialog = Dialog,
+  }, Model.new(1))
+  local diagnostics_callback
+  local diagnostics_cancelled = false
+  ui:open {
+    refresh = function() end,
+    install_from_github = function() end,
+    sync_local_folder = function() end,
+    request_diagnostics = function(_, callback)
+      diagnostics_callback = callback
+      return {
+        cancel = function()
+          diagnostics_cancelled = true
+        end,
+      }
+    end,
+    on_dialog_closed = function() end,
+  }
+
+  dialogs[1].widgetsById.help.definition.onclick()
+  local help_dialog = dialogs[2]
+  Test.equal(help_dialog.widgetsById.help_git.definition.text, "? Checking…")
+  Test.equal(help_dialog.widgetsById.help_gh.definition.text, "? Checking…")
+
+  diagnostics_callback({
+    tools = {
+      git = {
+        installed = false,
+      },
+      gh = {
+        installed = true,
+        version = "2.50.0",
+        authenticated = false,
+      },
+    },
+  })
+  Test.equal(help_dialog.widgetsById.help_git.definition.text, "✕ Not installed")
+  Test.equal(
+    help_dialog.widgetsById.help_gh.definition.text,
+    "✓ Installed · 2.50.0 · ✕ Sign-in unavailable"
+  )
+
+  help_dialog:close()
+  Test.truthy(diagnostics_cancelled)
+  diagnostics_callback({
+    tools = {
+      git = {
+        installed = true,
+      },
+      gh = {
+        installed = true,
+        authenticated = true,
+      },
+    },
+  })
+  Test.equal(help_dialog.widgetsById.help_git.definition.text, "✕ Not installed")
+  Test.equal(
+    help_dialog.widgetsById.help_gh.definition.text,
+    "✓ Installed · 2.50.0 · ✕ Sign-in unavailable"
+  )
 end)
 
 Test.case("sort and filter controls update browse and installed independently", function()
@@ -558,7 +662,10 @@ Test.case("sort and filter controls update browse and installed independently", 
     "installed_sort",
   }) do
     Test.equal(manager.widgetsById[id].kind, "combobox")
-    Test.truthy(manager.widgetsById[id].definition.visible)
+    Test.equal(
+      manager.widgetsById[id].definition.visible,
+      id:find("browse_", 1, true) == 1
+    )
     Test.falsy(manager.widgetsById[id].definition.label)
     Test.falsy(manager.widgetsById[id].definition.hexpand)
   end
@@ -603,6 +710,7 @@ Test.case("sort and filter controls update browse and installed independently", 
   Test.equal(model.browseSort, "recent")
   Test.equal(model.installedSort, "name_asc")
 
+  manager:selectTab("manager_tabs", "installed_tab")
   manager.data.installed_filter = "Updates Available"
   manager.widgetsById.installed_filter.definition.onchange()
   Test.equal(model.installedFilter, "updates")
@@ -627,6 +735,7 @@ Test.case("sort and filter controls update browse and installed independently", 
     },
   }, "current", false, false)
   model:set_filter("browse", "unavailable")
+  manager:selectTab("manager_tabs", "browse_tab")
   ui:refresh()
   Test.truthy(manager.widgetsById.browse_empty.definition.visible)
   Test.equal(
@@ -707,8 +816,10 @@ end)
 Test.case("manager package rows switch between wide and narrow layouts", function()
   local app = Fakes.app {
     allFilesExist = true,
+    uiScale = 2,
   }
   local Dialog, dialogs = Fakes.dialog_factory {
+    sizeHintWidth = 1800,
     shrinkSizeHintOnShow = 120,
   }
   local Timer, timers = Fakes.timer_factory()
@@ -743,9 +854,19 @@ Test.case("manager package rows switch between wide and narrow layouts", functio
   }
 
   local manager = dialogs[1]
-  Test.equal(ui.wideRowMinWidth, 640)
+  Test.equal(ui.wideRowMinWidth, 1120)
   timers[#timers]:fire()
-  for _, kind in ipairs({ "browse", "installed" }) do
+  local function assert_layout(kind, stacked)
+    manager:selectTab("manager_tabs", kind .. "_tab")
+    if stacked then
+      Test.falsy(manager.widgetsById[kind .. "_details_1"].definition.visible)
+      Test.truthy(manager.widgetsById[kind .. "_stacked_details_1"].definition.visible)
+      Test.falsy(manager.widgetsById[kind .. "_filter"].definition.visible)
+      Test.falsy(manager.widgetsById[kind .. "_sort"].definition.visible)
+      Test.truthy(manager.widgetsById[kind .. "_stacked_filter"].definition.visible)
+      Test.truthy(manager.widgetsById[kind .. "_stacked_sort"].definition.visible)
+      return
+    end
     Test.truthy(manager.widgetsById[kind .. "_details_1"].definition.visible)
     Test.falsy(manager.widgetsById[kind .. "_stacked_details_1"].definition.visible)
     Test.truthy(manager.widgetsById[kind .. "_filter"].definition.visible)
@@ -753,18 +874,16 @@ Test.case("manager package rows switch between wide and narrow layouts", functio
     Test.falsy(manager.widgetsById[kind .. "_stacked_filter"].definition.visible)
     Test.falsy(manager.widgetsById[kind .. "_stacked_sort"].definition.visible)
   end
+  for _, kind in ipairs({ "browse", "installed" }) do
+    assert_layout(kind, false)
+  end
 
   manager:resize(520)
   local narrow_timer = timers[#timers]
   Test.truthy(narrow_timer.started)
   narrow_timer:fire()
   for _, kind in ipairs({ "browse", "installed" }) do
-    Test.falsy(manager.widgetsById[kind .. "_details_1"].definition.visible)
-    Test.truthy(manager.widgetsById[kind .. "_stacked_details_1"].definition.visible)
-    Test.truthy(manager.widgetsById[kind .. "_filter"].definition.visible)
-    Test.truthy(manager.widgetsById[kind .. "_sort"].definition.visible)
-    Test.falsy(manager.widgetsById[kind .. "_stacked_filter"].definition.visible)
-    Test.falsy(manager.widgetsById[kind .. "_stacked_sort"].definition.visible)
+    assert_layout(kind, true)
   end
   Test.equal(
     manager.widgetsById.browse_row_1.definition.text,
@@ -782,23 +901,148 @@ Test.case("manager package rows switch between wide and narrow layouts", functio
   manager.widgetsById.browse_stacked_details_1.definition.onclick()
   Test.equal(dialogs[2].options.title, "browse-package")
 
-  manager:resize(760)
+  manager:resize(1520)
   timers[#timers]:fire()
   for _, kind in ipairs({ "browse", "installed" }) do
-    Test.truthy(manager.widgetsById[kind .. "_details_1"].definition.visible)
-    Test.falsy(manager.widgetsById[kind .. "_stacked_details_1"].definition.visible)
-    Test.truthy(manager.widgetsById[kind .. "_filter"].definition.visible)
-    Test.truthy(manager.widgetsById[kind .. "_sort"].definition.visible)
-    Test.falsy(manager.widgetsById[kind .. "_stacked_filter"].definition.visible)
-    Test.falsy(manager.widgetsById[kind .. "_stacked_sort"].definition.visible)
+    assert_layout(kind, false)
   end
 
   manager:resize(520)
   local stale_timer = timers[#timers]
-  ui:close()
-  Test.truthy(stale_timer.stopped)
+  manager.bounds.width = 1520
+  manager:selectTab("manager_tabs", "browse_tab")
   stale_timer:fire()
+  Test.truthy(manager.widgetsById.browse_details_1.definition.visible)
+  Test.falsy(manager.widgetsById.browse_stacked_details_1.definition.visible)
+
+  manager:resize(520)
+  local close_timer = timers[#timers]
+  ui:close()
+  Test.truthy(close_timer.stopped)
+  close_timer:fire()
   Test.equal(#dialogs, 2, "responsive layout must not rebuild the manager")
+end)
+
+Test.case("inactive manager tab controls stay hidden until selected", function()
+  local Dialog, dialogs = Fakes.dialog_factory()
+  local model = Model.new(1)
+  model:set_catalog({
+    { name = "browse-package", version = "1.0.0" },
+  }, "current", false, false)
+  model:set_installed({
+    { name = "installed-package", version = "2.0.0", managed = true },
+  })
+  local ui = Ui.new({
+    app = Fakes.app {
+      allFilesExist = true,
+    },
+    plugin = Fakes.plugin(),
+    Dialog = Dialog,
+  }, model)
+  ui:open {
+    refresh = function() end,
+    install_from_github = function() end,
+    sync_local_folder = function() end,
+    on_dialog_closed = function() end,
+  }
+
+  local manager = dialogs[1]
+  local function assert_inactive_hidden(kind)
+    Test.falsy(manager.widgetsById[kind .. "_search_label"].definition.visible)
+    Test.falsy(manager.widgetsById[kind .. "_search"].definition.visible)
+    Test.falsy(manager.widgetsById[kind .. "_filter"].definition.visible)
+    Test.falsy(manager.widgetsById[kind .. "_sort"].definition.visible)
+    Test.falsy(manager.widgetsById[kind .. "_stacked_filter"].definition.visible)
+    Test.falsy(manager.widgetsById[kind .. "_stacked_sort"].definition.visible)
+    Test.falsy(manager.widgetsById[kind .. "_empty"].definition.visible)
+    Test.falsy(manager.widgetsById[kind .. "_row_1"].definition.visible)
+    Test.falsy(manager.widgetsById[kind .. "_details_1"].definition.visible)
+    Test.falsy(manager.widgetsById[kind .. "_stacked_details_1"].definition.visible)
+    Test.falsy(manager.widgetsById[kind .. "_previous"].definition.visible)
+    Test.falsy(manager.widgetsById[kind .. "_page"].definition.visible)
+    Test.falsy(manager.widgetsById[kind .. "_next"].definition.visible)
+  end
+
+  local function assert_search_visible(kind)
+    if manager.widgetsById[kind .. "_search_label"] then
+      Test.truthy(manager.widgetsById[kind .. "_search_label"].definition.visible)
+    end
+    Test.truthy(manager.widgetsById[kind .. "_search"].definition.visible)
+  end
+
+  Test.equal(manager.data.manager_tabs, "browse_tab")
+  Test.equal(ui.activeView, "browse")
+  assert_search_visible("browse")
+  assert_inactive_hidden("installed")
+
+  manager:selectTab("manager_tabs", "installed_tab")
+  Test.equal(manager.data.manager_tabs, "installed_tab")
+  Test.equal(ui.activeView, "installed")
+  assert_inactive_hidden("browse")
+  assert_search_visible("installed")
+  Test.truthy(manager.widgetsById.installed_row_1.definition.visible)
+  Test.truthy(manager.widgetsById.installed_details_1.definition.visible)
+  Test.falsy(manager.widgetsById.installed_stacked_details_1.definition.visible)
+  Test.truthy(manager.widgetsById.installed_filter.definition.visible)
+  Test.falsy(manager.widgetsById.installed_stacked_filter.definition.visible)
+  Test.truthy(manager.widgetsById.installed_page.definition.visible)
+
+  manager:resize(500)
+  assert_inactive_hidden("browse")
+  Test.falsy(manager.widgetsById.installed_details_1.definition.visible)
+  Test.truthy(manager.widgetsById.installed_stacked_details_1.definition.visible)
+  Test.falsy(manager.widgetsById.installed_filter.definition.visible)
+  Test.truthy(manager.widgetsById.installed_stacked_filter.definition.visible)
+
+  manager:selectTab("manager_tabs", "browse_tab")
+  Test.equal(ui.activeView, "browse")
+  assert_inactive_hidden("installed")
+  assert_search_visible("browse")
+  Test.falsy(manager.widgetsById.browse_details_1.definition.visible)
+  Test.truthy(manager.widgetsById.browse_stacked_details_1.definition.visible)
+  Test.falsy(manager.widgetsById.browse_filter.definition.visible)
+  Test.truthy(manager.widgetsById.browse_stacked_filter.definition.visible)
+end)
+
+Test.case("manager opens wide by default and stacks on a small Aseprite window", function()
+  local function open_manager(window_width)
+    local Dialog, dialogs = Fakes.dialog_factory {
+      boundsWidth = 500,
+    }
+    local model = Model.new(1)
+    model:set_catalog({
+      { name = "browse-package", version = "1.0.0" },
+    }, "current", false, false)
+    local ui = Ui.new({
+      app = Fakes.app {
+        allFilesExist = true,
+        windowWidth = window_width,
+      },
+      plugin = Fakes.plugin(),
+      Dialog = Dialog,
+    }, model)
+    ui:open {
+      refresh = function() end,
+      install_from_github = function() end,
+      sync_local_folder = function() end,
+      on_dialog_closed = function() end,
+    }
+    return ui, dialogs[1]
+  end
+
+  local wide_ui, wide = open_manager(1000)
+  Test.equal(wide.bounds.width, 720)
+  Test.falsy(wide_ui.rowsStacked)
+  Test.truthy(wide.widgetsById.browse_details_1.definition.visible)
+  Test.falsy(wide.widgetsById.browse_stacked_details_1.definition.visible)
+
+  local narrow_ui, narrow = open_manager(540)
+  Test.equal(narrow.bounds.width, 508)
+  Test.truthy(narrow_ui.rowsStacked)
+  Test.falsy(narrow.widgetsById.browse_details_1.definition.visible)
+  Test.truthy(narrow.widgetsById.browse_stacked_details_1.definition.visible)
+  Test.falsy(narrow.widgetsById.browse_filter.definition.visible)
+  Test.truthy(narrow.widgetsById.browse_stacked_filter.definition.visible)
 end)
 
 Test.case("compact pagers navigate browse and installed independently", function()
@@ -831,7 +1075,10 @@ Test.case("compact pagers navigate browse and installed independently", function
   local manager = dialogs[1]
   for _, kind in ipairs({ "browse", "installed" }) do
     Test.equal(manager.widgetsById[kind .. "_page"].definition.text, "1 / 2")
-    Test.truthy(manager.widgetsById[kind .. "_page"].definition.visible)
+    Test.equal(
+      manager.widgetsById[kind .. "_page"].definition.visible,
+      kind == "browse"
+    )
     Test.falsy(manager.widgetsById[kind .. "_previous"].definition.enabled)
     Test.truthy(manager.widgetsById[kind .. "_next"].definition.enabled)
   end
@@ -848,6 +1095,9 @@ Test.case("compact pagers navigate browse and installed independently", function
   Test.falsy(manager.widgetsById.browse_previous.definition.enabled)
   Test.truthy(manager.widgetsById.browse_next.definition.enabled)
 
+  manager:selectTab("manager_tabs", "installed_tab")
+  Test.falsy(manager.widgetsById.browse_page.definition.visible)
+  Test.truthy(manager.widgetsById.installed_page.definition.visible)
   manager.widgetsById.installed_next.definition.onclick()
   Test.equal(manager.widgetsById.installed_page.definition.text, "2 / 2")
   Test.truthy(manager.widgetsById.installed_previous.definition.enabled)
@@ -872,6 +1122,10 @@ Test.case("compact pagers remain one native button row without samerow support",
     { name = "one", version = "1.0.0" },
     { name = "two", version = "1.0.0" },
   }, "current", false, false)
+  model:set_installed({
+    { name = "installed-one", version = "1.0.0", managed = false },
+    { name = "installed-two", version = "1.0.0", managed = true },
+  })
   local ui = Ui.new({
     app = Fakes.app {
       allFilesExist = true,
@@ -893,8 +1147,17 @@ Test.case("compact pagers remain one native button row without samerow support",
   Test.equal(manager.widgetsById.browse_previous.definition.text, "←")
   Test.equal(manager.widgetsById.browse_page.definition.text, "1 / 2")
   Test.equal(manager.widgetsById.browse_next.definition.text, "→")
+  Test.falsy(manager.widgetsById.browse_row_1)
+  Test.falsy(manager.widgetsById.installed_row_1)
   Test.truthy(manager.widgetsById.browse_details_1.definition.visible)
+  Test.falsy(manager.widgetsById.installed_details_1.definition.visible)
+  Test.contains(manager.widgetsById.browse_details_1.definition.label, "one  v1.0.0")
+  Test.contains(
+    manager.widgetsById.installed_details_1.definition.label,
+    "installed-one  v1.0.0"
+  )
   Test.falsy(manager.widgetsById.browse_stacked_details_1)
+  Test.falsy(manager.widgetsById.installed_stacked_details_1)
   Test.truthy(manager.widgetsById.browse_filter.definition.visible)
   Test.truthy(manager.widgetsById.browse_sort.definition.visible)
   Test.falsy(manager.widgetsById.browse_filter.definition.label)
@@ -903,6 +1166,22 @@ Test.case("compact pagers remain one native button row without samerow support",
   Test.truthy(manager.widgetsById.browse_sort.definition.hexpand)
   Test.falsy(manager.widgetsById.browse_stacked_filter)
   Test.falsy(manager.widgetsById.browse_stacked_sort)
+
+  manager.widgetsById.browse_next.definition.onclick()
+  Test.equal(manager.widgetsById.browse_page.definition.text, "2 / 2")
+  Test.contains(manager.widgetsById.browse_details_1.definition.label, "two  v1.0.0")
+
+  manager:selectTab("manager_tabs", "installed_tab")
+  Test.falsy(manager.widgetsById.browse_details_1.definition.visible)
+  Test.truthy(manager.widgetsById.installed_details_1.definition.visible)
+  Test.falsy(manager.widgetsById.browse_filter.definition.visible)
+  Test.truthy(manager.widgetsById.installed_filter.definition.visible)
+  manager.widgetsById.installed_next.definition.onclick()
+  Test.equal(manager.widgetsById.installed_page.definition.text, "2 / 2")
+  Test.contains(
+    manager.widgetsById.installed_details_1.definition.label,
+    "installed-two  v1.0.0"
+  )
 end)
 
 Test.case("secondary windows are resizable and scroll when space is constrained", function()
@@ -942,6 +1221,8 @@ Test.case("secondary windows are resizable and scroll when space is constrained"
   }, "browse")
 
   Test.equal(#dialogs, 10)
+  Test.equal(dialogs[8].widgetsById.help_git.definition.text, "? Could not check")
+  Test.equal(dialogs[8].widgetsById.help_gh.definition.text, "? Could not check")
   for _, dialog in ipairs(dialogs) do
     Test.truthy(dialog.options.resizeable)
     Test.equal(type(dialog.shown), "table")
@@ -1129,7 +1410,7 @@ Test.case("catalog identities are searchable and manifest names appear in detail
   Test.equal(dialogs[1].widgets[1].definition.text, "Example-Tools")
 end)
 
-Test.case("installed details expose explicit native lifecycle handoffs", function()
+Test.case("installed details route uninstall through the helper", function()
   local app = Fakes.app {
     allFilesExist = true,
   }
@@ -1140,28 +1421,42 @@ Test.case("installed details expose explicit native lifecycle handoffs", functio
     plugin = Fakes.plugin(),
     Dialog = Dialog,
   }, model)
+  local native_handoffs = 0
+  local uninstall_requests = 0
   ui:open {
     refresh = function() end,
     install_from_github = function() end,
     sync_local_folder = function() end,
     on_dialog_closed = function() end,
-    open_native_extension_preferences = function() end,
+    open_native_extension_preferences = function()
+      native_handoffs = native_handoffs + 1
+    end,
+    uninstall_package = function(_, package)
+      Test.equal(package.name, "example")
+      uninstall_requests = uninstall_requests + 1
+      return true
+    end,
   }
   ui:show_package_details({
     name = "example",
     displayName = "Example",
     version = "1.0.0",
+    path = "/profile/extensions/example",
     managed = false,
   }, "installed")
 
   local buttons = {}
   for _, widget in ipairs(dialogs[2].widgets) do
     if widget.kind == "button" then
-      buttons[widget.definition.text] = true
+      buttons[widget.definition.text] = widget.definition
     end
   end
   Test.truthy(buttons["Enable / Disable…"])
   Test.truthy(buttons["Uninstall…"])
+  buttons["Uninstall…"].onclick()
+  Test.equal(uninstall_requests, 1)
+  Test.equal(native_handoffs, 0)
+  Test.truthy(dialogs[2].closed)
 end)
 
 Test.case("help keeps hidden manager update and recovery actions available", function()
@@ -1386,6 +1681,24 @@ Test.case("GitHub asset chooser returns numeric identifiers as strings", functio
   })
   Test.equal(selected, "42")
   Test.equal(#dialogs, 1)
+end)
+
+Test.case("GitHub install prompt mentions public and private repositories", function()
+  local app = Fakes.app {
+    allFilesExist = true,
+  }
+  local Dialog, dialogs = Fakes.dialog_factory()
+  local ui = Ui.new({
+    app = app,
+    plugin = Fakes.plugin(),
+    Dialog = Dialog,
+  }, Model.new(1))
+
+  ui:prompt_github_url()
+  Test.equal(
+    dialogs[1].widgetsById.github_prompt_source.definition.text,
+    "Enter a public or private GitHub repository URL or"
+  )
 end)
 
 Test.case("restricted generic manager installs can open the trusted release page", function()

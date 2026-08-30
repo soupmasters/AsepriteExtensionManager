@@ -7,6 +7,7 @@ function init(plugin)
     app = app,
     plugin = plugin,
     Dialog = Dialog,
+    Rectangle = Rectangle,
     WebSocket = WebSocket,
     WebSocketMessageType = WebSocketMessageType,
     Timer = Timer,

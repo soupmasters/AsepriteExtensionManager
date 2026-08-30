@@ -80,6 +80,23 @@ pub struct CacheEntry {
     pub bytes: u64,
 }
 
+#[derive(Clone, Debug)]
+pub struct QuarantinedExtension {
+    pub recovery_path: PathBuf,
+    pub receipt_cleanup_pending: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UninstallRecord {
+    schema_version: u32,
+    name: String,
+    version: String,
+    original_path: PathBuf,
+    phase: String,
+    uninstalled_at: DateTime<Utc>,
+}
+
 impl State {
     pub fn new(user_config_path: impl AsRef<Path>) -> RpcResult<Self> {
         let root = user_config_path.as_ref().join("extension-manager");
@@ -93,6 +110,7 @@ impl State {
     }
 
     pub fn ensure(&self) -> RpcResult<()> {
+        ensure_real_state_directory(&self.root)?;
         for name in [
             "cache",
             "receipts",
@@ -101,10 +119,11 @@ impl State {
             "tuf",
             "logs",
             "self-update",
+            "uninstalled",
         ] {
-            fs::create_dir_all(self.root.join(name)).map_err(RpcError::io)?;
+            ensure_real_state_directory(&self.root.join(name))?;
         }
-        Ok(())
+        self.reconcile_uninstalls()
     }
 
     pub fn begin_self_update(
@@ -319,10 +338,7 @@ impl State {
     }
 
     pub fn write_receipt(&self, receipt: &Receipt) -> RpcResult<PathBuf> {
-        let path = self
-            .root
-            .join("receipts")
-            .join(format!("{}.json", safe_package_id(&receipt.package_name)?));
+        let path = self.receipt_path(&receipt.package_name)?;
         let data = serde_json::to_vec_pretty(receipt)
             .map_err(|error| RpcError::internal(error.to_string()))?;
         atomic_write(&path, &data).map_err(RpcError::io)?;
@@ -330,12 +346,17 @@ impl State {
     }
 
     pub fn read_receipt(&self, package_name: &str) -> RpcResult<Option<Receipt>> {
-        let path = self
-            .root
-            .join("receipts")
-            .join(format!("{}.json", safe_package_id(package_name)?));
-        if !path.exists() {
-            return Ok(None);
+        let path = self.receipt_path(package_name)?;
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(RpcError::io(error)),
+        };
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(RpcError::state(format!(
+                "receipt must be a real file: {}",
+                path.display()
+            )));
         }
         let data = fs::read(&path).map_err(RpcError::io)?;
         serde_json::from_slice(&data).map(Some).map_err(|error| {
@@ -343,11 +364,92 @@ impl State {
         })
     }
 
+    pub fn quarantine_extension(
+        &self,
+        package_name: &str,
+        version: &str,
+        extension_path: &Path,
+        archive_receipt: bool,
+    ) -> RpcResult<QuarantinedExtension> {
+        let uninstalled = self.root.join("uninstalled");
+        ensure_real_state_directory(&uninstalled)?;
+        let quarantine = tempfile::Builder::new()
+            .prefix("extension-")
+            .tempdir_in(&uninstalled)
+            .map_err(RpcError::io)?;
+        let mut record = UninstallRecord {
+            schema_version: 1,
+            name: package_name.to_owned(),
+            version: version.to_owned(),
+            original_path: extension_path.to_owned(),
+            phase: "prepared".to_owned(),
+            uninstalled_at: Utc::now(),
+        };
+        let metadata = serde_json::to_vec_pretty(&record)
+            .map_err(|error| RpcError::internal(error.to_string()))?;
+        atomic_write(&quarantine.path().join("uninstall.json"), &metadata).map_err(RpcError::io)?;
+
+        if archive_receipt {
+            let receipt = self.receipt_path(package_name)?;
+            let metadata = fs::symlink_metadata(&receipt).map_err(RpcError::io)?;
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                return Err(RpcError::state(format!(
+                    "receipt must be a real file: {}",
+                    receipt.display()
+                )));
+            }
+            let archived_path = quarantine.path().join("receipt.json");
+            atomic_copy(&receipt, &archived_path).map_err(RpcError::io)?;
+            let archived: Receipt = serde_json::from_slice(
+                &fs::read(&archived_path).map_err(RpcError::io)?,
+            )
+            .map_err(|error| RpcError::state(format!("invalid archived receipt: {error}")))?;
+            if !archived.package_name.eq_ignore_ascii_case(package_name)
+                || archived.installed_version != version
+                || !files_equal(&receipt, &archived_path).map_err(RpcError::io)?
+            {
+                return Err(RpcError::state(
+                    "active receipt changed while the uninstall was being prepared",
+                ));
+            }
+        }
+
+        let quarantined_extension = quarantine.path().join("extension");
+        fs::rename(extension_path, &quarantined_extension).map_err(RpcError::io)?;
+        let quarantine = quarantine.keep();
+        let recovery_path = quarantine.join("extension");
+        let source_parent_synced = extension_path
+            .parent()
+            .is_some_and(|parent| sync_parent(parent).is_ok());
+        let quarantine_synced = sync_parent(&quarantine).is_ok();
+        let uninstalled_synced = sync_parent(&uninstalled).is_ok();
+        let move_is_durable = source_parent_synced && quarantine_synced && uninstalled_synced;
+        record.phase = "committed".to_owned();
+        if let Ok(metadata) = serde_json::to_vec_pretty(&record) {
+            let _ = atomic_write(&quarantine.join("uninstall.json"), &metadata);
+        }
+        let receipt_cleanup_pending = archive_receipt
+            && (!move_is_durable
+                || self
+                    .remove_matching_receipt(&quarantine, package_name, version)
+                    .is_err());
+        Ok(QuarantinedExtension {
+            recovery_path,
+            receipt_cleanup_pending,
+        })
+    }
+
     pub fn receipts(&self) -> RpcResult<Vec<Receipt>> {
+        let directory = self.root.join("receipts");
+        ensure_real_state_directory(&directory)?;
         let mut receipts: Vec<Receipt> = Vec::new();
-        for entry in fs::read_dir(self.root.join("receipts")).map_err(RpcError::io)? {
+        for entry in fs::read_dir(directory).map_err(RpcError::io)? {
             let entry = entry.map_err(RpcError::io)?;
             if entry.path().extension().and_then(|value| value.to_str()) != Some("json") {
+                continue;
+            }
+            let file_type = entry.file_type().map_err(RpcError::io)?;
+            if file_type.is_symlink() || !file_type.is_file() {
                 continue;
             }
             let data = fs::read(entry.path()).map_err(RpcError::io)?;
@@ -357,6 +459,102 @@ impl State {
         }
         receipts.sort_by(|left, right| left.package_name.cmp(&right.package_name));
         Ok(receipts)
+    }
+
+    fn receipt_path(&self, package_name: &str) -> RpcResult<PathBuf> {
+        let receipts = self.root.join("receipts");
+        ensure_real_state_directory(&receipts)?;
+        Ok(receipts.join(format!("{}.json", safe_package_id(package_name)?)))
+    }
+
+    fn remove_matching_receipt(
+        &self,
+        quarantine: &Path,
+        package_name: &str,
+        version: &str,
+    ) -> RpcResult<()> {
+        let archived_path = quarantine.join("receipt.json");
+        let archived_metadata = fs::symlink_metadata(&archived_path).map_err(RpcError::io)?;
+        if archived_metadata.file_type().is_symlink() || !archived_metadata.is_file() {
+            return Err(RpcError::state(
+                "archived uninstall receipt is not a real file",
+            ));
+        }
+        let archived: Receipt =
+            serde_json::from_slice(&fs::read(&archived_path).map_err(RpcError::io)?)
+                .map_err(|error| RpcError::state(format!("invalid archived receipt: {error}")))?;
+        if !archived.package_name.eq_ignore_ascii_case(package_name)
+            || archived.installed_version != version
+        {
+            return Err(RpcError::state(
+                "archived uninstall receipt does not match the extension",
+            ));
+        }
+
+        let active_path = self.receipt_path(package_name)?;
+        let active = match self.read_receipt(package_name)? {
+            Some(receipt) => receipt,
+            None => return Ok(()),
+        };
+        if !active.package_name.eq_ignore_ascii_case(package_name)
+            || active.installed_version != version
+            || !files_equal(&active_path, &archived_path).map_err(RpcError::io)?
+        {
+            return Err(RpcError::state(
+                "active receipt changed during the uninstall transaction",
+            ));
+        }
+        fs::remove_file(&active_path).map_err(RpcError::io)?;
+        sync_parent(
+            active_path
+                .parent()
+                .ok_or_else(|| RpcError::state("receipt path has no parent"))?,
+        )
+        .map_err(RpcError::io)
+    }
+
+    fn reconcile_uninstalls(&self) -> RpcResult<()> {
+        let uninstalled = self.root.join("uninstalled");
+        for entry in fs::read_dir(&uninstalled).map_err(RpcError::io)? {
+            let entry = entry.map_err(RpcError::io)?;
+            let file_type = entry.file_type().map_err(RpcError::io)?;
+            if file_type.is_symlink() || !file_type.is_dir() {
+                continue;
+            }
+            let record_path = entry.path().join("uninstall.json");
+            let record_metadata = match fs::symlink_metadata(&record_path) {
+                Ok(metadata) => metadata,
+                Err(_) => continue,
+            };
+            if record_metadata.file_type().is_symlink() || !record_metadata.is_file() {
+                continue;
+            }
+            let record: UninstallRecord = match fs::read(&record_path)
+                .ok()
+                .and_then(|data| serde_json::from_slice::<UninstallRecord>(&data).ok())
+            {
+                Some(record)
+                    if record.schema_version == 1
+                        && matches!(record.phase.as_str(), "prepared" | "committed") =>
+                {
+                    record
+                }
+                _ => continue,
+            };
+            let recovery = entry.path().join("extension");
+            let recovery_metadata = match fs::symlink_metadata(&recovery) {
+                Ok(metadata) => metadata,
+                Err(_) => continue,
+            };
+            if recovery_metadata.file_type().is_symlink() || !recovery_metadata.is_dir() {
+                continue;
+            }
+            if fs::symlink_metadata(&record.original_path).is_ok() {
+                continue;
+            }
+            let _ = self.remove_matching_receipt(&entry.path(), &record.name, &record.version);
+        }
+        Ok(())
     }
 
     pub fn cache_status(&self) -> RpcResult<Vec<CacheEntry>> {
@@ -456,6 +654,31 @@ impl State {
     }
 }
 
+fn ensure_real_state_directory(path: &Path) -> RpcResult<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                return Err(RpcError::state(format!(
+                    "manager state path must be a real directory: {}",
+                    path.display()
+                )));
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            fs::create_dir_all(path).map_err(RpcError::io)?;
+            let metadata = fs::symlink_metadata(path).map_err(RpcError::io)?;
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                return Err(RpcError::state(format!(
+                    "manager state path must be a real directory: {}",
+                    path.display()
+                )));
+            }
+        }
+        Err(error) => return Err(RpcError::io(error)),
+    }
+    Ok(())
+}
+
 pub fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let parent = path
         .parent()
@@ -495,18 +718,32 @@ fn sync_parent(_: &Path) -> io::Result<()> {
 }
 
 fn safe_package_id(name: &str) -> RpcResult<String> {
-    if name.is_empty()
-        || name.len() > 128
-        || !name
-            .chars()
-            .all(|character| character.is_ascii_alphanumeric() || "-._".contains(character))
-    {
+    if !package_id_is_safe(name) {
         return Err(RpcError::invalid(
             "INVALID_PACKAGE_NAME",
             "package name contains unsupported characters",
         ));
     }
     Ok(name.to_lowercase())
+}
+
+pub(crate) fn package_id_is_safe(name: &str) -> bool {
+    if name.is_empty()
+        || name.len() > 128
+        || matches!(name, "." | "..")
+        || name.ends_with('.')
+        || !name
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || "-._".contains(character))
+    {
+        return false;
+    }
+    let stem = name.split('.').next().unwrap_or(name).to_ascii_uppercase();
+    !matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        && !stem
+            .strip_prefix("COM")
+            .or_else(|| stem.strip_prefix("LPT"))
+            .is_some_and(|suffix| suffix.len() == 1 && matches!(suffix.as_bytes()[0], b'1'..=b'9'))
 }
 
 pub fn sha256_file(path: &Path) -> io::Result<(String, u64)> {
@@ -589,6 +826,128 @@ fn evict_directory(directory: &Path, limit: u64, protected: Option<&Path>) -> io
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn receipt(name: &str, version: &str) -> Receipt {
+        Receipt {
+            schema_version: 1,
+            package_name: name.to_owned(),
+            source_kind: "github-release".to_owned(),
+            source: serde_json::json!({"kind":"github-release"}),
+            installed_version: version.to_owned(),
+            commit: None,
+            release: Some(format!("v{version}")),
+            asset: None,
+            artifact_sha256: "0".repeat(64),
+            artifact_byte_length: 1,
+            installed_at: Utc::now(),
+            local_folder: None,
+            content_hash: None,
+            previous_artifact: None,
+            previous_source: None,
+            previous_version: None,
+            previous_artifact_sha256: None,
+            previous_artifact_byte_length: None,
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn state_rejects_symlinked_receipt_and_uninstall_directories() {
+        use std::os::unix::fs::symlink;
+
+        for directory_name in ["receipts", "uninstalled"] {
+            let temporary = tempfile::tempdir().expect("tempdir");
+            let state_root = temporary.path().join("extension-manager");
+            let outside = temporary.path().join("outside");
+            fs::create_dir_all(&state_root).expect("state root");
+            fs::create_dir_all(&outside).expect("outside directory");
+            symlink(&outside, state_root.join(directory_name)).expect("state directory symlink");
+
+            let error = State::new(temporary.path()).expect_err("symlinked state directory");
+
+            assert_eq!(error.code, "INVALID_STATE");
+            assert!(error.message.contains("must be a real directory"));
+            assert!(fs::read_dir(&outside)
+                .expect("outside contents")
+                .next()
+                .is_none());
+        }
+    }
+
+    #[test]
+    fn startup_reconciles_receipt_cleanup_after_a_committed_move() {
+        let temporary = tempfile::tempdir().expect("tempdir");
+        let state = State::new(temporary.path()).expect("state");
+        let active_receipt = state
+            .write_receipt(&receipt("sample", "1.0.0"))
+            .expect("active receipt");
+        let quarantine = state.root().join("uninstalled/extension-crash");
+        fs::create_dir_all(quarantine.join("extension")).expect("recovery extension");
+        atomic_copy(&active_receipt, &quarantine.join("receipt.json")).expect("archived receipt");
+        let record = UninstallRecord {
+            schema_version: 1,
+            name: "sample".to_owned(),
+            version: "1.0.0".to_owned(),
+            original_path: temporary.path().join("extensions/sample"),
+            phase: "prepared".to_owned(),
+            uninstalled_at: Utc::now(),
+        };
+        atomic_write(
+            &quarantine.join("uninstall.json"),
+            &serde_json::to_vec_pretty(&record).expect("record JSON"),
+        )
+        .expect("uninstall record");
+
+        let restarted = State::new(temporary.path()).expect("restarted state");
+
+        assert!(restarted
+            .read_receipt("sample")
+            .expect("read receipt")
+            .is_none());
+        assert!(quarantine.join("receipt.json").is_file());
+        assert!(quarantine.join("extension").is_dir());
+    }
+
+    #[test]
+    fn startup_does_not_remove_a_replaced_same_version_receipt() {
+        let temporary = tempfile::tempdir().expect("tempdir");
+        let state = State::new(temporary.path()).expect("state");
+        let archived_receipt = state
+            .write_receipt(&receipt("sample", "1.0.0"))
+            .expect("active receipt");
+        let quarantine = state.root().join("uninstalled/extension-crash");
+        fs::create_dir_all(quarantine.join("extension")).expect("recovery extension");
+        atomic_copy(&archived_receipt, &quarantine.join("receipt.json")).expect("archived receipt");
+        let record = UninstallRecord {
+            schema_version: 1,
+            name: "sample".to_owned(),
+            version: "1.0.0".to_owned(),
+            original_path: temporary.path().join("extensions/sample"),
+            phase: "committed".to_owned(),
+            uninstalled_at: Utc::now(),
+        };
+        atomic_write(
+            &quarantine.join("uninstall.json"),
+            &serde_json::to_vec_pretty(&record).expect("record JSON"),
+        )
+        .expect("uninstall record");
+        let mut replacement = receipt("sample", "1.0.0");
+        replacement.source = serde_json::json!({"kind":"local-folder"});
+        state
+            .write_receipt(&replacement)
+            .expect("replacement receipt");
+
+        let restarted = State::new(temporary.path()).expect("restarted state");
+
+        assert_eq!(
+            restarted
+                .read_receipt("sample")
+                .expect("read receipt")
+                .expect("preserved replacement")
+                .source,
+            serde_json::json!({"kind":"local-folder"})
+        );
+    }
 
     #[test]
     fn staging_repairs_corrupted_content_addressed_destinations() {
@@ -736,7 +1095,39 @@ mod tests {
     fn rejects_unsafe_package_ids() {
         let temporary = tempfile::tempdir().expect("tempdir");
         let state = State::new(temporary.path()).expect("state");
-        assert!(state.cached_artifact("../escape", false).is_err());
+        for name in [
+            "../escape",
+            ".",
+            "..",
+            "CON",
+            "con.json",
+            "PRN",
+            "aux.extension",
+            "NUL",
+            "COM1",
+            "com9.package",
+            "LPT1",
+            "LPT9.x",
+            "name.",
+        ] {
+            assert!(
+                state.cached_artifact(name, false).is_err(),
+                "unsafe package name should fail: {name}"
+            );
+        }
+        for name in [
+            "valid.package-name",
+            "console",
+            "COM0",
+            "COM10",
+            "LPT0",
+            "LPT10",
+        ] {
+            assert!(
+                state.cached_artifact(name, false).is_ok(),
+                "non-device package name should remain valid: {name}"
+            );
+        }
     }
 
     #[test]

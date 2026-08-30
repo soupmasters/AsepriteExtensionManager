@@ -1388,14 +1388,14 @@ function Ui:_build()
     dialog:button {
       id = "github_details_" .. tostring(index),
       label = not self.supportsSameRow and "" or nil,
-      text = "Install",
+      text = "Install ▾",
       visible = false,
       focus = false,
       hexpand = false,
       onclick = function()
         local repository = self.githubRows[row_index]
         if repository then
-          self.controller:install_github_repository(repository)
+          self:show_github_repository_menu(repository)
         end
       end,
     }
@@ -1412,14 +1412,14 @@ function Ui:_build()
     if self.supportsSameRow then
       dialog:button {
         id = "github_stacked_details_" .. tostring(index),
-        text = "Install",
+        text = "Install ▾",
         visible = false,
         focus = false,
         hexpand = false,
         onclick = function()
           local repository = self.githubRows[row_index]
           if repository then
-            self.controller:install_github_repository(repository)
+            self:show_github_repository_menu(repository)
           end
         end,
       }
@@ -1742,13 +1742,13 @@ function Ui:refresh()
   if not self.githubAuthenticated then
     github_empty_message = "Sign in with gh auth login to browse accessible repositories."
   elseif self.model.githubLoading then
-    github_empty_message = "Loading GitHub repositories..."
+    github_empty_message = "Looking for Aseprite extension repositories..."
   elseif self.model.githubError then
     github_empty_message = Protocol.error_message(self.model.githubError)
   elseif self.model.githubLoaded and github_count == 0 and self.model.githubSearch ~= "" then
-    github_empty_message = "No GitHub repositories match this search."
+    github_empty_message = "No Aseprite extension repositories match this search."
   elseif self.model.githubLoaded and github_count == 0 then
-    github_empty_message = "No accessible GitHub repositories were found."
+    github_empty_message = "No Aseprite extension repositories were found."
   end
   dialog:modify {
     id = "github_empty",
@@ -2235,6 +2235,66 @@ function Ui:show_preferences()
   }
   self.screen = "preferences"
   self:refresh()
+  return true
+end
+
+function Ui:show_github_repository_menu(repository)
+  if type(repository) ~= "table" then
+    return false
+  end
+  local menu = self.environment.Dialog {
+    parent = self:_parent(),
+  }
+  add_package_menu_info(
+    menu,
+    "github_repository_identity",
+    nil,
+    text(repository.nameWithOwner, "Unnamed repository")
+  )
+  if type(repository.description) == "string" and repository.description ~= "" then
+    add_package_menu_info(
+      menu,
+      "github_repository_description",
+      "Description",
+      repository.description
+    )
+  end
+  add_package_menu_info(
+    menu,
+    "github_repository_visibility",
+    "Visibility",
+    repository.isPrivate and "Private" or "Public"
+  )
+  if repository.isArchived then
+    add_package_menu_info(menu, "github_repository_status", "Status", "Archived")
+  elseif repository.isFork then
+    add_package_menu_info(menu, "github_repository_status", "Status", "Fork")
+  end
+  if type(repository.updatedAt) == "string" and repository.updatedAt ~= "" then
+    add_package_menu_info(
+      menu,
+      "github_repository_updated",
+      "Updated",
+      repository.updatedAt:sub(1, 10)
+    )
+  end
+  if type(repository.viewerPermission) == "string" and repository.viewerPermission ~= "" then
+    add_package_menu_info(
+      menu,
+      "github_repository_permission",
+      "Permission",
+      repository.viewerPermission
+    )
+  end
+  add_package_menu_info(menu, "github_repository_url", "Repository", text(repository.url))
+  menu:menuItem {
+    id = "github_repository_install",
+    text = "Install",
+    onclick = function()
+      self.controller:install_github_repository(repository)
+    end,
+  }
+  menu:showMenu()
   return true
 end
 

@@ -144,13 +144,13 @@ Test.case("GitHub repository browsing uses bounded cursor requests", function()
         isPrivate = true,
       },
     },
-    totalCount = 8,
+    totalCount = 2,
     hasNextPage = true,
     endCursor = "next==",
   })
   Test.falsy(controller.model.githubLoading)
   Test.truthy(controller.model.githubLoaded)
-  Test.equal(controller.model.githubTotal, 8)
+  Test.equal(controller.model.githubTotal, 2)
   Test.equal(controller.model.githubPageCount, 2)
   Test.equal(controller.model.githubRepositories[1].nameWithOwner, "example/animation-tools")
 
@@ -160,7 +160,7 @@ Test.case("GitHub repository browsing uses bounded cursor requests", function()
   Test.equal(rpc.requests[2].params.cursor, "next==")
   rpc:respond(2, {
     repositories = {},
-    totalCount = 8,
+    totalCount = 0,
     hasNextPage = false,
   })
   Test.equal(controller.model.githubPage, 2)

@@ -199,7 +199,7 @@ Test.case("GitHub repository pages stay separate from installed view state", fun
       url = "https://github.com/example/public-extension",
       isPrivate = false,
     },
-  }, 2, 5, true, "next==")
+  }, 2, 3, true, "next==")
 
   local repositories, page, pages, total = model:page("github")
   Test.equal(#repositories, 2)
@@ -611,11 +611,11 @@ Test.case("manager uses compact native install and utility controls", function()
   for index = 1, model.pageSize do
     Test.equal(
       manager.widgetsById["github_details_" .. tostring(index)].definition.text,
-      "Install"
+      "Install ▾"
     )
     Test.equal(
       manager.widgetsById["github_stacked_details_" .. tostring(index)].definition.text,
-      "Install"
+      "Install ▾"
     )
   end
 
@@ -802,7 +802,31 @@ Test.case("GitHub tab requires both tools and browses signed-in repositories", f
   Test.equal(searches[2], "animation")
   manager.widgetsById.github_next.definition.onclick()
   Test.equal(page_moves[1], 1)
-  manager.widgetsById.github_details_1.definition.onclick()
+  manager.widgetsById.github_stacked_details_1.definition.onclick()
+  local install_menu = dialogs[2]
+  Test.equal(install_menu.options.parent, manager)
+  Test.truthy(install_menu.shownMenu)
+  Test.equal(
+    install_menu.widgetsById.github_repository_identity.definition.text,
+    "example/private-extension"
+  )
+  Test.equal(
+    install_menu.widgetsById.github_repository_description.definition.text,
+    "Description: Private extension"
+  )
+  Test.equal(
+    install_menu.widgetsById.github_repository_visibility.definition.text,
+    "Visibility: Private"
+  )
+  Test.falsy(install_menu.widgetsById.github_repository_visibility.definition.enabled)
+  Test.equal(
+    install_menu.widgetsById.github_repository_updated.definition.text,
+    "Updated: 2026-08-30"
+  )
+  Test.equal(install_menu.widgetsById.github_repository_install.kind, "menuItem")
+  Test.equal(install_menu.widgetsById.github_repository_install.definition.text, "Install")
+  Test.falsy(installed_repository)
+  install_menu.widgetsById.github_repository_install.definition.onclick()
   Test.equal(installed_repository.url, "https://github.com/example/private-extension")
 end)
 

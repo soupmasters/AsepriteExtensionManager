@@ -215,10 +215,14 @@ end
 
 function Model:set_github_page(packages, page, total, has_next_page, end_cursor)
   self.githubRepositories = packages or {}
-  self.githubTotal = math.max(0, tonumber(total) or #self.githubRepositories)
-  self.githubPageCount = math.max(1, math.ceil(self.githubTotal / self.pageSize))
-  self.githubPage = math.max(1, math.min(tonumber(page) or 1, self.githubPageCount))
+  self.githubPage = math.max(1, tonumber(page) or 1)
   self.githubHasNextPage = has_next_page == true
+  local page_offset = (self.githubPage - 1) * self.pageSize
+  local reported = math.max(0, tonumber(total) or #self.githubRepositories)
+  self.githubTotal = page_offset + math.max(#self.githubRepositories, reported)
+  self.githubPageCount = self.githubHasNextPage
+      and self.githubPage + 1
+    or self.githubPage
   self.githubEndCursor = type(end_cursor) == "string" and end_cursor or nil
   self.githubLoading = false
   self.githubLoaded = true

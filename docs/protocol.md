@@ -101,7 +101,7 @@ progress to be routed without another mutable identifier.
 | `scanInstalled` | Read installed user-extension manifests and join managed receipts. |
 | `uninstallPackage` | Revalidate one exact scanned user extension, move its folder to recovery storage, journal matching-receipt cleanup, and require an Aseprite restart. |
 | `refreshRegistry` | Refresh and authenticate catalog metadata, or load last-known-good cache. |
-| `listGitHubRepositories` | List one bounded page of repositories through the signed-in GitHub CLI. |
+| `listGitHubRepositories` | List one bounded page of likely Aseprite extension repositories through the signed-in GitHub CLI. |
 | `resolveGitHub` | Resolve a supported public or authenticated private GitHub URL to explicit candidates or immutable source. |
 | `preparePackage` | Download, validate, normalize, hash, stage, and cache a resolved artifact. |
 | `prepareSelfUpdate` | With `{}`, prepare a newer manager release from the canonical repository together with a recovery archive and pending journal. |
@@ -126,9 +126,13 @@ A later check resolves the ref again through the same flow; changed snapshot
 bytes can be an update even when the manifest version is the same.
 
 `listGitHubRepositories` accepts only a bounded search string and an opaque,
-bounded page cursor. The helper runs one fixed GraphQL query through `gh api`,
-normalizes repository metadata, and constructs canonical repository URLs. No
-caller-provided command, executable, host, or GraphQL document is accepted.
+bounded page cursor. The helper runs fixed GraphQL queries through `gh api`,
+scans past unrelated repositories, and returns only repositories with a valid
+Aseprite-shaped root manifest or a stable `.aseprite-extension` release asset.
+Manifest blobs are read by immutable GitHub node ID, kept in memory only, and
+bounded before parsing. Page cursors refer to displayed matches so filtering
+does not skip or duplicate an extension. No caller-provided command,
+executable, host, or GraphQL document is accepted.
 
 `diagnostics` includes structured Git and GitHub CLI status used by Help. A
 tool check is noninteractive and time-bounded. Authentication status is a

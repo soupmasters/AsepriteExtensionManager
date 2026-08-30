@@ -1455,9 +1455,9 @@ mod tests {
 
         let versions = TrustedVersions {
             root: 1,
-            timestamp: 5,
-            snapshot: 5,
-            targets: 5,
+            timestamp: 6,
+            snapshot: 6,
+            targets: 6,
         };
         atomic_write(
             &client.state.tuf_path("trusted-versions.json"),

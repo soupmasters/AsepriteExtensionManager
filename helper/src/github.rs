@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::ffi::OsString;
 use std::fs;
 use std::io::Write;
@@ -5,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
+use futures_util::future::try_join_all;
 use percent_encoding::{percent_decode_str, utf8_percent_encode, NON_ALPHANUMERIC};
 use reqwest::header::{HeaderMap, ETAG, IF_NONE_MATCH};
 use reqwest::{Client, StatusCode};
@@ -19,7 +21,7 @@ use crate::package::{
     PreparedPackage, MAX_ARCHIVE_BYTES,
 };
 use crate::protocol::{RpcError, RpcResult};
-use crate::state::{atomic_write, State};
+use crate::state::{atomic_write, package_id_is_safe, State};
 use crate::tooling::{self, Tool};
 use crate::VERSION;
 
@@ -27,10 +29,16 @@ const API_ROOT: &str = "https://api.github.com";
 const GH_JSON_BYTES: u64 = 4 * 1024 * 1024;
 const GH_JSON_TIMEOUT: Duration = Duration::from_secs(30);
 const GH_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(120);
-const GH_REPOSITORY_JSON_BYTES: u64 = 512 * 1024;
-const GH_REPOSITORY_PAGE_SIZE: u32 = 6;
-const GH_REPOSITORY_QUERY: &str = r#"query($first:Int!,$after:String){viewer{repositories(first:$first,after:$after,affiliations:[OWNER,COLLABORATOR,ORGANIZATION_MEMBER],orderBy:{field:UPDATED_AT,direction:DESC}){totalCount pageInfo{hasNextPage endCursor} nodes{name owner{login} description isPrivate isArchived isFork updatedAt viewerPermission}}}}"#;
-const GH_REPOSITORY_SEARCH_QUERY: &str = r#"query($first:Int!,$after:String,$search:String!){search(type:REPOSITORY,query:$search,first:$first,after:$after){repositoryCount pageInfo{hasNextPage endCursor} nodes{... on Repository{name owner{login} description isPrivate isArchived isFork updatedAt viewerPermission}}}}"#;
+const GH_REPOSITORY_JSON_BYTES: u64 = 8 * 1024 * 1024;
+const GH_REPOSITORY_PAGE_SIZE: usize = 6;
+const GH_REPOSITORY_SCAN_PAGE_SIZE: u32 = 50;
+const GH_REPOSITORY_SCAN_LIMIT: usize = 500;
+const GH_REPOSITORY_SCAN_TIMEOUT: Duration = Duration::from_secs(60);
+const GH_REPOSITORY_MANIFEST_BYTES: u64 = 64 * 1024;
+const GH_REPOSITORY_MANIFEST_BATCH_SIZE: usize = 16;
+const GH_REPOSITORY_QUERY: &str = r#"query($first:Int!,$after:String){viewer{repositories(first:$first,after:$after,affiliations:[OWNER,COLLABORATOR,ORGANIZATION_MEMBER],orderBy:{field:UPDATED_AT,direction:DESC}){totalCount pageInfo{hasNextPage endCursor} edges{cursor node{name owner{login} description isPrivate isArchived isFork updatedAt viewerPermission manifest:object(expression:"HEAD:package.json"){... on Blob{id oid byteSize isBinary isTruncated}} latestRelease{isDraft isPrerelease releaseAssets(first:100){nodes{name}}}}}}}}"#;
+const GH_REPOSITORY_SEARCH_QUERY: &str = r#"query($first:Int!,$after:String,$search:String!){search(type:REPOSITORY,query:$search,first:$first,after:$after){repositoryCount pageInfo{hasNextPage endCursor} edges{cursor node{... on Repository{name owner{login} description isPrivate isArchived isFork updatedAt viewerPermission manifest:object(expression:"HEAD:package.json"){... on Blob{id oid byteSize isBinary isTruncated}} latestRelease{isDraft isPrerelease releaseAssets(first:100){nodes{name}}}}}}}}"#;
+const GH_REPOSITORY_MANIFEST_QUERY: &str = r#"query($ids:[ID!]!){nodes(ids:$ids){... on Blob{id oid byteSize isBinary isTruncated text}}}"#;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum GitHubAccess {
@@ -334,9 +342,7 @@ impl GitHubClient {
                 "Git and GitHub CLI are required to browse GitHub repositories",
             ));
         };
-        let arguments = github_repository_arguments(query.as_deref(), cursor.as_deref());
-        let body = run_gh_graphql_with_executable(&executable, &arguments).await?;
-        parse_repository_page(&body, query.is_some())
+        list_repositories_with_executable(&executable, query.as_deref(), cursor.as_deref()).await
     }
 
     pub async fn latest_manager_release(
@@ -988,7 +994,7 @@ struct RepositoryConnection {
     total_count: u64,
     page_info: RepositoryPageInfo,
     #[serde(default)]
-    nodes: Vec<Option<RepositoryNode>>,
+    edges: Vec<RepositoryEdge>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -997,7 +1003,13 @@ struct SearchRepositoryConnection {
     repository_count: u64,
     page_info: RepositoryPageInfo,
     #[serde(default)]
-    nodes: Vec<Option<RepositoryNode>>,
+    edges: Vec<RepositoryEdge>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RepositoryEdge {
+    cursor: String,
+    node: Option<RepositoryNode>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1018,6 +1030,68 @@ struct RepositoryNode {
     is_fork: bool,
     updated_at: Option<String>,
     viewer_permission: Option<String>,
+    manifest: Option<RepositoryManifestProbe>,
+    latest_release: Option<RepositoryLatestRelease>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RepositoryManifestProbe {
+    id: Option<String>,
+    oid: Option<String>,
+    #[serde(default)]
+    byte_size: u64,
+    #[serde(default)]
+    is_binary: bool,
+    #[serde(default)]
+    is_truncated: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RepositoryManifestBlob {
+    id: String,
+    oid: String,
+    #[serde(default)]
+    byte_size: u64,
+    #[serde(default)]
+    is_binary: bool,
+    #[serde(default)]
+    is_truncated: bool,
+    text: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RepositoryLatestRelease {
+    #[serde(default)]
+    is_draft: bool,
+    #[serde(default)]
+    is_prerelease: bool,
+    release_assets: RepositoryReleaseAssets,
+}
+
+#[derive(Debug, Deserialize)]
+struct RepositoryReleaseAssets {
+    #[serde(default)]
+    nodes: Vec<Option<RepositoryReleaseAsset>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RepositoryReleaseAsset {
+    name: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct RepositoryManifestData {
+    #[serde(default)]
+    nodes: Vec<Option<RepositoryManifestBlob>>,
+}
+
+#[derive(Debug)]
+struct RepositoryBatch {
+    edges: Vec<RepositoryEdge>,
+    page_info: RepositoryPageInfo,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1088,7 +1162,7 @@ fn github_repository_arguments(query: Option<&str>, cursor: Option<&str>) -> Vec
         OsString::from("-f"),
         OsString::from(format!("query={graph_query}")),
         OsString::from("-F"),
-        OsString::from(format!("first={GH_REPOSITORY_PAGE_SIZE}")),
+        OsString::from(format!("first={GH_REPOSITORY_SCAN_PAGE_SIZE}")),
     ];
     if let Some(cursor) = cursor {
         arguments.push(OsString::from("-f"));
@@ -1101,6 +1175,48 @@ fn github_repository_arguments(query: Option<&str>, cursor: Option<&str>) -> Vec
         )));
     }
     arguments
+}
+
+fn github_repository_manifest_arguments(ids: &[String]) -> RpcResult<Vec<OsString>> {
+    if ids.is_empty() || ids.len() > GH_REPOSITORY_MANIFEST_BATCH_SIZE {
+        return Err(RpcError::invalid(
+            "INVALID_GITHUB_RESPONSE",
+            "GitHub returned an invalid extension manifest batch",
+        ));
+    }
+    let mut arguments = vec![
+        OsString::from("api"),
+        OsString::from("--hostname"),
+        OsString::from("github.com"),
+        OsString::from("--method"),
+        OsString::from("POST"),
+        OsString::from("-H"),
+        OsString::from("Accept: application/vnd.github+json"),
+        OsString::from("-H"),
+        OsString::from("X-GitHub-Api-Version: 2022-11-28"),
+        OsString::from("graphql"),
+        OsString::from("-f"),
+        OsString::from(format!("query={GH_REPOSITORY_MANIFEST_QUERY}")),
+    ];
+    for id in ids {
+        validate_graph_ql_node_id(id)?;
+        arguments.push(OsString::from("-f"));
+        arguments.push(OsString::from(format!("ids[]={id}")));
+    }
+    Ok(arguments)
+}
+
+fn validate_graph_ql_node_id(id: &str) -> RpcResult<()> {
+    if id.is_empty()
+        || id.len() > 512
+        || !id.is_ascii()
+        || id
+            .bytes()
+            .any(|byte| byte.is_ascii_control() || byte.is_ascii_whitespace())
+    {
+        return Err(invalid_graph_ql_response());
+    }
+    Ok(())
 }
 
 async fn run_gh_graphql_with_executable(
@@ -1182,15 +1298,171 @@ async fn run_gh_graphql_with_executable(
     ))
 }
 
-fn parse_repository_page(body: &[u8], searched: bool) -> RpcResult<GitHubRepositoryPage> {
+async fn list_repositories_with_executable(
+    executable: &Path,
+    query: Option<&str>,
+    cursor: Option<&str>,
+) -> RpcResult<GitHubRepositoryPage> {
+    match tokio::time::timeout(
+        GH_REPOSITORY_SCAN_TIMEOUT,
+        scan_repositories_with_executable(executable, query, cursor),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => Err(RpcError::new(
+            "GITHUB_CLI_TIMEOUT",
+            "GitHub repository scan did not finish in time",
+            true,
+        )),
+    }
+}
+
+async fn scan_repositories_with_executable(
+    executable: &Path,
+    query: Option<&str>,
+    cursor: Option<&str>,
+) -> RpcResult<GitHubRepositoryPage> {
+    let mut scan_cursor = cursor.map(ToOwned::to_owned);
+    let mut scanned = 0_usize;
+    let mut matches = Vec::new();
+    let mut last_scanned_cursor = None;
+    let mut raw_has_next_page = true;
+
+    while matches.len() <= GH_REPOSITORY_PAGE_SIZE
+        && scanned < GH_REPOSITORY_SCAN_LIMIT
+        && raw_has_next_page
+    {
+        let arguments = github_repository_arguments(query, scan_cursor.as_deref());
+        let body = run_gh_graphql_with_executable(executable, &arguments).await?;
+        let batch = parse_repository_batch(&body, query.is_some())?;
+        let manifest_texts = load_repository_manifests(executable, &batch.edges).await?;
+        raw_has_next_page = batch.page_info.has_next_page;
+
+        for edge in batch.edges {
+            let edge_cursor = normalize_repository_cursor(Some(edge.cursor))?
+                .ok_or_else(invalid_graph_ql_response)?;
+            scanned += 1;
+            last_scanned_cursor = Some(edge_cursor.clone());
+            if let Some(node) = edge
+                .node
+                .filter(|node| is_aseprite_repository(node, &manifest_texts))
+            {
+                matches.push((normalize_repository(node)?, edge_cursor));
+                if matches.len() > GH_REPOSITORY_PAGE_SIZE {
+                    break;
+                }
+            }
+            if scanned >= GH_REPOSITORY_SCAN_LIMIT {
+                break;
+            }
+        }
+
+        if matches.len() > GH_REPOSITORY_PAGE_SIZE || scanned >= GH_REPOSITORY_SCAN_LIMIT {
+            break;
+        }
+        if raw_has_next_page {
+            scan_cursor = normalize_repository_cursor(batch.page_info.end_cursor)?;
+            if scan_cursor.is_none() {
+                return Err(invalid_graph_ql_response());
+            }
+        }
+    }
+
+    let found_another_match = matches.len() > GH_REPOSITORY_PAGE_SIZE;
+    let scan_was_bounded = scanned >= GH_REPOSITORY_SCAN_LIMIT && raw_has_next_page;
+    let has_next_page = found_another_match || scan_was_bounded;
+    let end_cursor = if found_another_match {
+        matches
+            .get(GH_REPOSITORY_PAGE_SIZE - 1)
+            .map(|(_, cursor)| cursor.clone())
+    } else if scan_was_bounded {
+        last_scanned_cursor
+    } else {
+        None
+    };
+    let repositories = matches
+        .into_iter()
+        .take(GH_REPOSITORY_PAGE_SIZE)
+        .map(|(repository, _)| repository)
+        .collect::<Vec<_>>();
+    let total_count = repositories.len() as u64 + u64::from(has_next_page);
+
+    Ok(GitHubRepositoryPage {
+        repositories,
+        total_count,
+        has_next_page,
+        end_cursor,
+    })
+}
+
+async fn load_repository_manifests(
+    executable: &Path,
+    edges: &[RepositoryEdge],
+) -> RpcResult<HashMap<String, String>> {
+    let expected = edges
+        .iter()
+        .filter_map(|edge| edge.node.as_ref())
+        .filter(|node| !has_aseprite_release_asset(node))
+        .filter_map(|node| node.manifest.as_ref())
+        .filter(|probe| valid_manifest_probe(probe))
+        .filter_map(|probe| Some((probe.id.as_ref()?.clone(), probe)))
+        .collect::<HashMap<_, _>>();
+    let mut texts = HashMap::new();
+    let ids = expected.keys().cloned().collect::<Vec<_>>();
+    let requests = ids
+        .chunks(GH_REPOSITORY_MANIFEST_BATCH_SIZE)
+        .map(|ids| async move {
+            let arguments = github_repository_manifest_arguments(ids)?;
+            run_gh_graphql_with_executable(executable, &arguments).await
+        });
+    for body in try_join_all(requests).await? {
+        let response: GraphQlResponse<RepositoryManifestData> = parse_graph_ql_response(&body)?;
+        let data = response.data.ok_or_else(invalid_graph_ql_response)?;
+        for blob in data.nodes.into_iter().flatten() {
+            let Some(probe) = expected.get(&blob.id) else {
+                return Err(invalid_graph_ql_response());
+            };
+            if probe.oid.as_deref() != Some(blob.oid.as_str())
+                || blob.byte_size != probe.byte_size
+                || blob.is_binary != probe.is_binary
+                || blob.is_truncated != probe.is_truncated
+            {
+                return Err(invalid_graph_ql_response());
+            }
+            let Some(text) = blob.text else {
+                continue;
+            };
+            if text.len() as u64 == blob.byte_size {
+                texts.insert(blob.id, text);
+            }
+        }
+    }
+    Ok(texts)
+}
+
+fn valid_manifest_probe(probe: &RepositoryManifestProbe) -> bool {
+    let Some(id) = probe.id.as_deref() else {
+        return false;
+    };
+    let Some(oid) = probe.oid.as_deref() else {
+        return false;
+    };
+    validate_graph_ql_node_id(id).is_ok()
+        && (oid.len() == 40 || oid.len() == 64)
+        && oid.bytes().all(|byte| byte.is_ascii_hexdigit())
+        && !probe.is_binary
+        && !probe.is_truncated
+        && probe.byte_size > 0
+        && probe.byte_size <= GH_REPOSITORY_MANIFEST_BYTES
+}
+
+fn parse_repository_batch(body: &[u8], searched: bool) -> RpcResult<RepositoryBatch> {
     if searched {
         let response: GraphQlResponse<SearchRepositoryData> = parse_graph_ql_response(body)?;
         let connection = response.data.ok_or_else(invalid_graph_ql_response)?.search;
-        normalize_repository_page(
-            connection.nodes,
-            connection.repository_count,
-            connection.page_info,
-        )
+        let _ = connection.repository_count;
+        normalize_repository_batch(connection.edges, connection.page_info)
     } else {
         let response: GraphQlResponse<ViewerRepositoryData> = parse_graph_ql_response(body)?;
         let connection = response
@@ -1198,11 +1470,8 @@ fn parse_repository_page(body: &[u8], searched: bool) -> RpcResult<GitHubReposit
             .ok_or_else(invalid_graph_ql_response)?
             .viewer
             .repositories;
-        normalize_repository_page(
-            connection.nodes,
-            connection.total_count,
-            connection.page_info,
-        )
+        let _ = connection.total_count;
+        normalize_repository_batch(connection.edges, connection.page_info)
     }
 }
 
@@ -1252,25 +1521,113 @@ fn graph_ql_errors_are_rate_limited(errors: &[GraphQlError]) -> bool {
     })
 }
 
-fn normalize_repository_page(
-    nodes: Vec<Option<RepositoryNode>>,
-    total_count: u64,
+fn normalize_repository_batch(
+    edges: Vec<RepositoryEdge>,
     page_info: RepositoryPageInfo,
-) -> RpcResult<GitHubRepositoryPage> {
-    let repositories = nodes
-        .into_iter()
-        .flatten()
-        .map(normalize_repository)
-        .collect::<RpcResult<Vec<_>>>()?;
+) -> RpcResult<RepositoryBatch> {
     let end_cursor = normalize_repository_cursor(page_info.end_cursor)?;
-    if page_info.has_next_page && end_cursor.is_none() {
+    if page_info.has_next_page && (end_cursor.is_none() || edges.is_empty()) {
         return Err(invalid_graph_ql_response());
     }
-    Ok(GitHubRepositoryPage {
-        repositories,
-        total_count,
-        has_next_page: page_info.has_next_page,
-        end_cursor,
+    Ok(RepositoryBatch {
+        edges,
+        page_info: RepositoryPageInfo {
+            has_next_page: page_info.has_next_page,
+            end_cursor,
+        },
+    })
+}
+
+fn is_aseprite_repository(node: &RepositoryNode, manifest_texts: &HashMap<String, String>) -> bool {
+    has_aseprite_release_asset(node) || has_aseprite_manifest(node, manifest_texts)
+}
+
+fn has_aseprite_release_asset(node: &RepositoryNode) -> bool {
+    node.latest_release.as_ref().is_some_and(|release| {
+        !release.is_draft
+            && !release.is_prerelease
+            && release.release_assets.nodes.iter().flatten().any(|asset| {
+                asset
+                    .name
+                    .to_ascii_lowercase()
+                    .ends_with(".aseprite-extension")
+            })
+    })
+}
+
+fn has_aseprite_manifest(node: &RepositoryNode, manifest_texts: &HashMap<String, String>) -> bool {
+    let Some(probe) = node
+        .manifest
+        .as_ref()
+        .filter(|probe| valid_manifest_probe(probe))
+    else {
+        return false;
+    };
+    let Some(id) = probe.id.as_deref() else {
+        return false;
+    };
+    let Some(text) = manifest_texts.get(id) else {
+        return false;
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else {
+        return false;
+    };
+    let Some(object) = value.as_object() else {
+        return false;
+    };
+    let valid_name = object
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(package_id_is_safe);
+    let valid_version = object
+        .get("version")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|version| !version.trim().is_empty() && version.len() <= 128);
+    if !valid_name || !valid_version {
+        return false;
+    }
+    let Some(contributes) = object
+        .get("contributes")
+        .and_then(serde_json::Value::as_object)
+    else {
+        return false;
+    };
+    contributes.iter().any(|(kind, value)| match kind.as_str() {
+        "scripts" => valid_script_contribution(value),
+        "keys" | "languages" | "themes" | "palettes" | "ditheringMatrices" => {
+            valid_resource_contribution(value)
+        }
+        _ => false,
+    })
+}
+
+fn valid_script_contribution(value: &serde_json::Value) -> bool {
+    if value.as_str().is_some_and(|path| !path.trim().is_empty()) {
+        return true;
+    }
+    value.as_array().is_some_and(|entries| {
+        entries.iter().any(|entry| {
+            entry
+                .get("path")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|path| !path.trim().is_empty())
+        })
+    })
+}
+
+fn valid_resource_contribution(value: &serde_json::Value) -> bool {
+    value.as_array().is_some_and(|entries| {
+        entries.iter().any(|entry| {
+            let identifier = entry
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|identifier| !identifier.trim().is_empty());
+            let path = entry
+                .get("path")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|path| !path.trim().is_empty());
+            identifier && path
+        })
     })
 }
 
@@ -1881,6 +2238,50 @@ mod tests {
     const MANAGER_OWNER: &str = "soupmasters";
     const MANAGER_REPOSITORY: &str = "AsepriteExtensionManager";
 
+    fn repository_node() -> RepositoryNode {
+        RepositoryNode {
+            name: "sample-extension".to_owned(),
+            owner: RepositoryOwner {
+                login: "example".to_owned(),
+            },
+            description: None,
+            is_private: false,
+            is_archived: false,
+            is_fork: false,
+            updated_at: None,
+            viewer_permission: Some("READ".to_owned()),
+            manifest: None,
+            latest_release: None,
+        }
+    }
+
+    fn repository_with_manifest(text: &str) -> (RepositoryNode, HashMap<String, String>) {
+        let mut node = repository_node();
+        node.manifest = Some(RepositoryManifestProbe {
+            id: Some("manifest-node-id".to_owned()),
+            oid: Some("1".repeat(40)),
+            byte_size: text.len() as u64,
+            is_binary: false,
+            is_truncated: false,
+        });
+        let manifests = HashMap::from([("manifest-node-id".to_owned(), text.to_owned())]);
+        (node, manifests)
+    }
+
+    fn repository_with_release(asset: &str, draft: bool, prerelease: bool) -> RepositoryNode {
+        let mut node = repository_node();
+        node.latest_release = Some(RepositoryLatestRelease {
+            is_draft: draft,
+            is_prerelease: prerelease,
+            release_assets: RepositoryReleaseAssets {
+                nodes: vec![Some(RepositoryReleaseAsset {
+                    name: asset.to_owned(),
+                })],
+            },
+        });
+        node
+    }
+
     fn write_repository_snapshot(path: &Path, name: &str, version: &str) {
         let output = fs::File::create(path).unwrap();
         let mut archive = zip::ZipWriter::new(output);
@@ -2441,7 +2842,7 @@ printf '%s' '{"ok":true}'
                 "-f",
                 &format!("query={GH_REPOSITORY_QUERY}"),
                 "-F",
-                "first=6",
+                "first=50",
             ]
             .into_iter()
             .map(OsString::from)
@@ -2461,6 +2862,18 @@ printf '%s' '{"ok":true}'
                 .expect("dynamic argument");
             assert_eq!(searched[index - 1], "-f");
         }
+
+        let manifest = github_repository_manifest_arguments(&[
+            "MDQ6QmxvYjE=".to_owned(),
+            "MDQ6QmxvYjI=".to_owned(),
+        ])
+        .unwrap();
+        assert!(manifest.contains(&OsString::from(format!(
+            "query={GH_REPOSITORY_MANIFEST_QUERY}"
+        ))));
+        assert!(manifest.contains(&OsString::from("ids[]=MDQ6QmxvYjE=")));
+        assert!(manifest.contains(&OsString::from("ids[]=MDQ6QmxvYjI=")));
+        assert!(github_repository_manifest_arguments(&[]).is_err());
     }
 
     #[test]
@@ -2471,26 +2884,30 @@ printf '%s' '{"ok":true}'
               "repositories": {
                 "totalCount": 7,
                 "pageInfo": {"hasNextPage": true, "endCursor": "next=="},
-                "nodes": [{
-                  "name": "Private.Extension",
-                  "owner": {"login": "example-owner"},
-                  "description": "  One\n  useful   extension  ",
-                  "isPrivate": true,
-                  "isArchived": false,
-                  "isFork": false,
-                  "updatedAt": "2026-08-30T12:00:00Z",
-                  "viewerPermission": "ADMIN"
+                "edges": [{
+                  "cursor": "edge-one==",
+                  "node": {
+                    "name": "Private.Extension",
+                    "owner": {"login": "example-owner"},
+                    "description": "  One\n  useful   extension  ",
+                    "isPrivate": true,
+                    "isArchived": false,
+                    "isFork": false,
+                    "updatedAt": "2026-08-30T12:00:00Z",
+                    "viewerPermission": "ADMIN",
+                    "manifest": null,
+                    "latestRelease": null
+                  }
                 }]
               }
             }
           }
         }"#;
-        let page = parse_repository_page(body, false).unwrap();
-        assert_eq!(page.total_count, 7);
-        assert!(page.has_next_page);
-        assert_eq!(page.end_cursor.as_deref(), Some("next=="));
-        assert_eq!(page.repositories.len(), 1);
-        let repository = &page.repositories[0];
+        let mut batch = parse_repository_batch(body, false).unwrap();
+        assert!(batch.page_info.has_next_page);
+        assert_eq!(batch.page_info.end_cursor.as_deref(), Some("next=="));
+        assert_eq!(batch.edges.len(), 1);
+        let repository = normalize_repository(batch.edges.remove(0).node.unwrap()).unwrap();
         assert_eq!(
             repository.name_with_owner,
             "example-owner/Private.Extension"
@@ -2514,25 +2931,35 @@ printf '%s' '{"ok":true}'
             "search": {
               "repositoryCount": 1,
               "pageInfo": {"hasNextPage": false, "endCursor": null},
-              "nodes": [{
-                "name": "public-extension",
-                "owner": {"login": "someone"},
-                "description": null,
-                "isPrivate": false,
-                "isArchived": false,
-                "isFork": true,
-                "updatedAt": null,
-                "viewerPermission": "READ"
-              }]
+                "edges": [{
+                  "cursor": "search-edge==",
+                  "node": {
+                    "name": "public-extension",
+                    "owner": {"login": "someone"},
+                    "description": null,
+                    "isPrivate": false,
+                    "isArchived": false,
+                    "isFork": true,
+                    "updatedAt": null,
+                    "viewerPermission": "READ",
+                    "manifest": null,
+                    "latestRelease": null
+                  }
+                }]
             }
           }
         }"#;
-        let page = parse_repository_page(search, true).unwrap();
-        assert_eq!(page.total_count, 1);
-        assert!(!page.has_next_page);
-        assert!(page.end_cursor.is_none());
+        let page = parse_repository_batch(search, true).unwrap();
+        assert!(!page.page_info.has_next_page);
+        assert!(page.page_info.end_cursor.is_none());
         assert_eq!(
-            page.repositories[0].name_with_owner,
+            page.edges[0].node.as_ref().unwrap().name,
+            "public-extension"
+        );
+        assert_eq!(
+            normalize_repository(page.edges.into_iter().next().unwrap().node.unwrap())
+                .unwrap()
+                .name_with_owner,
             "someone/public-extension"
         );
 
@@ -2540,12 +2967,152 @@ printf '%s' '{"ok":true}'
           "data": null,
           "errors": [{"message":"API rate limit exceeded","extensions":{"type":"RATE_LIMITED"}}]
         }"#;
-        let error = parse_repository_page(limited, false).unwrap_err();
+        let error = parse_repository_batch(limited, false).unwrap_err();
         assert_eq!(error.code, "GITHUB_RATE_LIMITED");
         assert!(error.retryable);
 
-        let malformed = parse_repository_page(br#"{"data":{}}"#, false).unwrap_err();
+        let malformed = parse_repository_batch(br#"{"data":{}}"#, false).unwrap_err();
         assert_eq!(malformed.code, "INVALID_GITHUB_RESPONSE");
+    }
+
+    #[test]
+    fn repository_browser_recognizes_only_aseprite_manifests_and_release_assets() {
+        for contribution in [
+            r#"{"scripts":[{"path":"./main.lua"}]}"#,
+            r#"{"keys":[{"id":"keys","path":"./keys.json"}]}"#,
+            r#"{"languages":[{"id":"en","path":"./en.ini"}]}"#,
+            r#"{"themes":[{"id":"dark","path":"./theme"}]}"#,
+            r#"{"palettes":[{"id":"colors","path":"./colors.gpl"}]}"#,
+            r#"{"ditheringMatrices":[{"id":"matrix","path":"./matrix.png"}]}"#,
+            r#"{"scripts":"./legacy.lua"}"#,
+        ] {
+            let manifest = format!(
+                r#"{{"name":"real-extension","version":"1.2.3","contributes":{contribution}}}"#
+            );
+            let (node, manifests) = repository_with_manifest(&manifest);
+            assert!(is_aseprite_repository(&node, &manifests));
+        }
+
+        for manifest in [
+            r#"{"name":"npm-package","version":"1.0.0","main":"index.js","scripts":{"test":"node test.js"},"dependencies":{"left-pad":"1"}}"#,
+            r#"{"name":"com.example.unity","version":"1.0.0","unity":"2022.3","dependencies":{"com.unity.modules.ui":"1.0.0"}}"#,
+            r#"{"name":"vscode-theme","version":"1.0.0","engines":{"vscode":"^1.80.0"},"contributes":{"themes":[{"label":"Dark","uiTheme":"vs-dark","path":"./theme.json"}]}}"#,
+            r#"{"name":"empty-extension","version":"1.0.0","contributes":{"scripts":[]}}"#,
+            r#"{"name":"wrong-shape","version":"1.0.0","contributes":{"languages":[{"id":"lua"}]}}"#,
+            r#"{"name":"broken","version":"1.0.0","contributes": "#,
+        ] {
+            let (node, manifests) = repository_with_manifest(manifest);
+            assert!(!is_aseprite_repository(&node, &manifests));
+        }
+
+        let stable = repository_with_release("PACKAGE.ASEPRITE-EXTENSION", false, false);
+        assert!(is_aseprite_repository(&stable, &HashMap::new()));
+        let wrong_suffix = repository_with_release("package.aseprite-extension.zip", false, false);
+        assert!(!is_aseprite_repository(&wrong_suffix, &HashMap::new()));
+        let draft = repository_with_release("package.aseprite-extension", true, false);
+        assert!(!is_aseprite_repository(&draft, &HashMap::new()));
+        let prerelease = repository_with_release("package.aseprite-extension", false, true);
+        assert!(!is_aseprite_repository(&prerelease, &HashMap::new()));
+    }
+
+    #[test]
+    fn repository_manifest_probes_are_bounded_and_immutable() {
+        let (mut node, manifests) = repository_with_manifest(
+            r#"{"name":"sample","version":"1.0.0","contributes":{"scripts":"./main.lua"}}"#,
+        );
+        assert!(has_aseprite_manifest(&node, &manifests));
+
+        node.manifest.as_mut().unwrap().is_binary = true;
+        assert!(!has_aseprite_manifest(&node, &manifests));
+        node.manifest.as_mut().unwrap().is_binary = false;
+        node.manifest.as_mut().unwrap().is_truncated = true;
+        assert!(!has_aseprite_manifest(&node, &manifests));
+        node.manifest.as_mut().unwrap().is_truncated = false;
+        node.manifest.as_mut().unwrap().byte_size = GH_REPOSITORY_MANIFEST_BYTES + 1;
+        assert!(!has_aseprite_manifest(&node, &manifests));
+        node.manifest.as_mut().unwrap().byte_size = 1;
+        node.manifest.as_mut().unwrap().oid = Some("not-a-blob-oid".to_owned());
+        assert!(!has_aseprite_manifest(&node, &manifests));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn repository_browser_scans_past_unrelated_raw_pages() {
+        let (directory, executable) = fake_gh(
+            r#"#!/bin/sh
+for argument in "$@"; do
+  if [ "$argument" = "after=raw-next==" ]; then
+    printf '%s' '{"data":{"viewer":{"repositories":{"totalCount":2,"pageInfo":{"hasNextPage":false,"endCursor":null},"edges":[{"cursor":"aseprite-cursor==","node":{"name":"real-extension","owner":{"login":"example"},"description":null,"isPrivate":false,"isArchived":false,"isFork":false,"updatedAt":null,"viewerPermission":"READ","manifest":null,"latestRelease":{"isDraft":false,"isPrerelease":false,"releaseAssets":{"nodes":[{"name":"real.aseprite-extension"}]}}}}]}}}}'
+    exit 0
+  fi
+done
+printf '%s' '{"data":{"viewer":{"repositories":{"totalCount":2,"pageInfo":{"hasNextPage":true,"endCursor":"raw-next=="},"edges":[{"cursor":"unity-cursor==","node":{"name":"unity-package","owner":{"login":"example"},"description":null,"isPrivate":false,"isArchived":false,"isFork":false,"updatedAt":null,"viewerPermission":"READ","manifest":null,"latestRelease":null}}]}}}}'
+"#,
+        );
+        let page = list_repositories_with_executable(&executable, None, None)
+            .await
+            .unwrap();
+        drop(directory);
+        assert_eq!(page.repositories.len(), 1);
+        assert_eq!(
+            page.repositories[0].name_with_owner,
+            "example/real-extension"
+        );
+        assert_eq!(page.total_count, 1);
+        assert!(!page.has_next_page);
+        assert!(page.end_cursor.is_none());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn repository_browser_cursor_follows_the_sixth_filtered_match() {
+        let edges = (1..=7)
+            .map(|index| {
+                serde_json::json!({
+                    "cursor": format!("cursor-{index}=="),
+                    "node": {
+                        "name": format!("extension-{index}"),
+                        "owner": {"login": "example"},
+                        "description": null,
+                        "isPrivate": false,
+                        "isArchived": false,
+                        "isFork": false,
+                        "updatedAt": null,
+                        "viewerPermission": "READ",
+                        "manifest": null,
+                        "latestRelease": {
+                            "isDraft": false,
+                            "isPrerelease": false,
+                            "releaseAssets": {
+                                "nodes": [{"name": format!("extension-{index}.aseprite-extension")}]
+                            }
+                        }
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        let response = serde_json::json!({
+            "data": {
+                "viewer": {
+                    "repositories": {
+                        "totalCount": 7,
+                        "pageInfo": {"hasNextPage": false, "endCursor": null},
+                        "edges": edges
+                    }
+                }
+            }
+        })
+        .to_string();
+        let script = format!("#!/bin/sh\nprintf '%s' '{response}'\n");
+        let (directory, executable) = fake_gh(&script);
+        let page = list_repositories_with_executable(&executable, None, None)
+            .await
+            .unwrap();
+        drop(directory);
+        assert_eq!(page.repositories.len(), GH_REPOSITORY_PAGE_SIZE);
+        assert_eq!(page.total_count, 7);
+        assert!(page.has_next_page);
+        assert_eq!(page.end_cursor.as_deref(), Some("cursor-6=="));
     }
 
     #[cfg(unix)]

@@ -87,8 +87,9 @@ profile for destructive failure simulations.
     restarting between them, uninstall a managed extension and a manually copied
     extension without `__info.json`. Confirm each disappears from the manager,
     its exact folder is moved to a separate recovery location, a uniquely
-    matching receipt is archived, its source folder is untouched, and Aseprite
-    requests one restart after the removals. Before restarting, confirm further
+    matching receipt is archived, its source folder is untouched, and the
+    manager shows a transient restart tip plus a persistent footer reminder
+    without opening a confirmation dialog. Before restarting, confirm further
     uninstall actions remain available only after the preceding helper request
     succeeds, while install, update, restore, refresh, cache, and extension
     settings actions stay blocked. Repeat once while closing the manager before

@@ -1455,28 +1455,22 @@ function Controller:uninstall_package(package)
       end
       self.model:set_installed(remaining)
       self:_set_uninstall_state(UNINSTALL_CONFIRMED)
-      self:_finish_operation(
-        operation,
-        "Removed " .. display_name .. " · restart after any other removals"
-      )
-      local notice = "Files for "
+      local status = "Removed " .. display_name .. " · restart after any other removals"
+      local tip = "Removed "
         .. display_name
-        .. " were moved out of Aseprite. You can remove more extensions, then restart "
-        .. "Aseprite when finished. The extension may remain partly active or stop working "
-        .. "until you restart. Do not "
-        .. "install, update, restore, refresh, or change extension settings before restarting."
+        .. ". Restart Aseprite when you are done removing extensions."
       if type(result.recoveryPath) == "string" and result.recoveryPath ~= "" then
-        notice = notice .. "\n\nRecovery copy:\n" .. result.recoveryPath
+        status = status .. " · recovery copy saved"
+        tip = tip .. " Recovery copy saved."
       end
       if result.receiptCleanupPending == true then
-        notice = notice
-          .. "\n\nReceipt cleanup will finish the next time the manager starts."
+        status = status .. " · receipt cleanup pending"
       end
-      self.app.alert {
-        title = "Extension Removed",
-        text = notice,
-        buttons = "OK",
-      }
+      self:_finish_operation(
+        operation,
+        status
+      )
+      self.app.tip(tip, 8)
     end,
     onError = function(error_value, helper_rejected)
       if helper_rejected == true then

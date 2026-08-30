@@ -820,6 +820,7 @@ Test.case("confirmed uninstalls can continue while other management stays locked
   Test.falsy(controller:uninstall_package(another))
   Test.equal(#rpc.requests, 1)
 
+  local tips_before_success = #calls.tips
   rpc:respond(1, {
     name = "animation-list",
     version = "2.0.0",
@@ -828,16 +829,18 @@ Test.case("confirmed uninstalls can continue while other management stays locked
     receiptCleanupPending = false,
   })
 
-  Test.equal(#calls.alerts, 1)
-  Test.equal(calls.alerts[1].title, "Extension Removed")
-  Test.contains(calls.alerts[1].text, "may remain partly active")
-  Test.contains(calls.alerts[1].text, "remove more extensions")
-  Test.contains(calls.alerts[1].text, "Recovery copy")
+  Test.equal(#calls.alerts, 0)
+  Test.equal(#calls.tips, tips_before_success + 1)
+  Test.equal(calls.tips[#calls.tips].duration, 8)
+  Test.contains(calls.tips[#calls.tips].message, "Removed Animation List")
+  Test.contains(calls.tips[#calls.tips].message, "Restart Aseprite")
+  Test.contains(calls.tips[#calls.tips].message, "Recovery copy saved")
   Test.truthy(controller.restartRequired)
   Test.equal(controller.uninstallState, "confirmed")
   Test.equal(#controller.model.installed, 1)
   Test.equal(controller.model.installed[1].name, "another")
   Test.contains(controller.model.status, "restart after any other removals")
+  Test.contains(controller.model.status, "recovery copy saved")
   Test.equal(#rpc.requests, 1)
 
   Test.falsy(controller:install_from_github())
@@ -870,6 +873,7 @@ Test.case("confirmed uninstalls can continue while other management stays locked
   Test.equal(#rpc.requests, 2)
   Test.equal(rpc.requests[2].method, "uninstallPackage")
   Test.equal(rpc.requests[2].params.path, "/profile/extensions/another")
+  tips_before_success = #calls.tips
   rpc:respond(2, {
     name = "another",
     version = "1.0.0",
@@ -881,7 +885,10 @@ Test.case("confirmed uninstalls can continue while other management stays locked
   Test.equal(controller.uninstallState, "confirmed")
   Test.truthy(controller.restartRequired)
   Test.equal(#controller.model.installed, 0)
-  Test.equal(#calls.alerts, 2)
+  Test.equal(#calls.alerts, 0)
+  Test.equal(#calls.tips, tips_before_success + 1)
+  Test.contains(calls.tips[#calls.tips].message, "Removed Another Extension")
+  Test.contains(calls.tips[#calls.tips].message, "Restart Aseprite")
   Test.equal(#ui.confirmations, 0)
 end)
 

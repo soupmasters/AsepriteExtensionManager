@@ -1,6 +1,6 @@
 use std::fs;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
@@ -299,11 +299,31 @@ impl GitHubClient {
         expected_length: u64,
         expected_name: &str,
         expected_version: &str,
+        repository_commit: Option<&str>,
     ) -> RpcResult<PreparedPackage> {
         let url = Url::parse(url)
             .map_err(|error| RpcError::invalid("INVALID_ASSET_URL", error.to_string()))?;
         let downloaded = self.download(url).await?;
-        let (actual_hash, actual_length) = crate::package::artifact_hash(&downloaded)?;
+        self.prepare_authenticated_download(
+            &downloaded,
+            expected_sha256,
+            expected_length,
+            expected_name,
+            expected_version,
+            repository_commit,
+        )
+    }
+
+    fn prepare_authenticated_download(
+        &self,
+        downloaded: &Path,
+        expected_sha256: &str,
+        expected_length: u64,
+        expected_name: &str,
+        expected_version: &str,
+        repository_commit: Option<&str>,
+    ) -> RpcResult<PreparedPackage> {
+        let (actual_hash, actual_length) = crate::package::artifact_hash(downloaded)?;
         if actual_length != expected_length || !actual_hash.eq_ignore_ascii_case(expected_sha256) {
             return Err(RpcError::invalid(
                 "AUTHENTICATED_ASSET_MISMATCH",
@@ -316,9 +336,39 @@ impl GitHubClient {
                 "actualByteLength": actual_length
             })));
         }
+
+        if let Some(commit) = repository_commit {
+            if commit.len() != 40
+                || !commit
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            {
+                return Err(RpcError::invalid(
+                    "INVALID_CATALOG_SNAPSHOT",
+                    "catalog repository snapshots require a lowercase 40-character commit",
+                ));
+            }
+            let package = package_repository_archive(&self.state, downloaded)?;
+            if !package.name.eq_ignore_ascii_case(expected_name)
+                || package.version != expected_version
+            {
+                return Err(RpcError::invalid(
+                    "MANIFEST_MISMATCH",
+                    "repository snapshot manifest differs from the authenticated catalog",
+                )
+                .with_details(serde_json::json!({
+                    "expectedName": expected_name,
+                    "actualName": package.name,
+                    "expectedVersion": expected_version,
+                    "actualVersion": package.version
+                })));
+            }
+            return Ok(package);
+        }
+
         let package = validate_and_stage(
             &self.state,
-            &downloaded,
+            downloaded,
             ExpectedManifest {
                 name: Some(expected_name),
                 version: Some(expected_version),
@@ -839,6 +889,78 @@ mod tests {
 
     const MANAGER_OWNER: &str = "soupmasters";
     const MANAGER_REPOSITORY: &str = "AsepriteExtensionManager";
+
+    fn write_repository_snapshot(path: &Path, name: &str, version: &str) {
+        let output = fs::File::create(path).unwrap();
+        let mut archive = zip::ZipWriter::new(output);
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        archive.add_directory("sample-commit/", options).unwrap();
+        archive
+            .start_file("sample-commit/package.json", options)
+            .unwrap();
+        archive
+            .write_all(
+                serde_json::json!({
+                    "name": name,
+                    "displayName": "Sample",
+                    "version": version,
+                    "contributes": {
+                        "scripts": [{"path": "./sample.lua"}]
+                    }
+                })
+                .to_string()
+                .as_bytes(),
+            )
+            .unwrap();
+        archive
+            .start_file("sample-commit/sample.lua", options)
+            .unwrap();
+        archive.write_all(b"return true\n").unwrap();
+        archive.finish().unwrap();
+    }
+
+    #[test]
+    fn authenticated_catalog_snapshot_is_normalized_after_source_verification() {
+        let temporary = tempfile::tempdir().unwrap();
+        let snapshot = temporary.path().join("snapshot.zip");
+        write_repository_snapshot(&snapshot, "sample", "1.2.3");
+        let (sha256, byte_length) = crate::package::artifact_hash(&snapshot).unwrap();
+        let state = State::new(temporary.path().join("state")).unwrap();
+        let github = GitHubClient::new(state).unwrap();
+        let commit = "1".repeat(40);
+
+        let package = github
+            .prepare_authenticated_download(
+                &snapshot,
+                &sha256,
+                byte_length,
+                "sample",
+                "1.2.3",
+                Some(&commit),
+            )
+            .unwrap();
+
+        assert_eq!(package.name, "sample");
+        assert_eq!(package.version, "1.2.3");
+        assert!(package.artifact_path.is_file());
+        assert_ne!(
+            package.sha256, sha256,
+            "normalized archive has its own digest"
+        );
+
+        let mismatch = github
+            .prepare_authenticated_download(
+                &snapshot,
+                &sha256,
+                byte_length,
+                "different",
+                "1.2.3",
+                Some(&commit),
+            )
+            .expect_err("authenticated manifest identity must match");
+        assert_eq!(mismatch.code, "MANIFEST_MISMATCH");
+    }
 
     fn manager_asset(version: &str, id: u64) -> ReleaseAsset {
         let name = format!("aseprite-extension-manager-{version}.aseprite-extension");

@@ -339,6 +339,9 @@ function Fakes.dialog_factory(factory_options)
           dialog.data[definition.id] = definition.text or ""
         elseif kind == "check" then
           dialog.data[definition.id] = definition.selected == true
+        elseif kind == "combobox" then
+          dialog.data[definition.id] = definition.option
+            or (definition.options and definition.options[1])
         end
       end
       return dialog
@@ -383,6 +386,9 @@ function Fakes.dialog_factory(factory_options)
       if existing then
         for key, value in pairs(definition) do
           existing.definition[key] = value
+        end
+        if existing.kind == "combobox" and definition.option ~= nil then
+          self.data[definition.id] = definition.option
         end
       end
       return self

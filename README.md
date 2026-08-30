@@ -3,7 +3,9 @@
 # Aseprite Extension Manager
 
 A small, unofficial extension manager for installing and updating Aseprite
-extensions from GitHub or a local folder.
+extensions from a bundled catalog, GitHub, or a local folder.
+
+[Suggest an extension for the catalog](https://github.com/soupmasters/AsepriteExtensionManager/issues/new?template=extension-suggestion.yml).
 
 The project is still in development.
 

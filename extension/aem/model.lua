@@ -4,6 +4,28 @@ Model.__index = Model
 local MANAGER_NAME = "aseprite-extension-manager"
 Model.MANAGER_NAME = MANAGER_NAME
 
+local BROWSE_SORTS = {
+  name_asc = true,
+  name_desc = true,
+  recent = true,
+}
+local INSTALLED_SORTS = {
+  name_asc = true,
+  name_desc = true,
+  updates_first = true,
+}
+local BROWSE_FILTERS = {
+  all = true,
+  compatible = true,
+  unavailable = true,
+}
+local INSTALLED_FILTERS = {
+  all = true,
+  updates = true,
+  managed = true,
+  unmanaged = true,
+}
+
 local function folded(value)
   return tostring(value or ""):lower()
 end
@@ -59,6 +81,82 @@ local function package_text(package)
   }, " "):lower()
 end
 
+local function package_sort_name(package)
+  return folded(
+    package.displayName
+      or package.name
+      or package.manifestName
+      or package.id
+      or ""
+  )
+end
+
+local function package_identity(package)
+  return table.concat({
+    folded(package.name),
+    folded(package.manifestName),
+    folded(package.id),
+  }, "\0")
+end
+
+local function name_before(left, right, descending)
+  local left_name = package_sort_name(left)
+  local right_name = package_sort_name(right)
+  if left_name ~= right_name then
+    if descending then
+      return left_name > right_name
+    end
+    return left_name < right_name
+  end
+  return package_identity(left) < package_identity(right)
+end
+
+local function has_update(package)
+  return package.update ~= nil and package.update ~= false
+end
+
+local function matches_filter(kind, selected, package)
+  if selected == "all" then
+    return true
+  end
+  if kind == "browse" then
+    local compatible = type(package.latest) == "table"
+    if selected == "compatible" then
+      return compatible
+    end
+    return not compatible
+  end
+  if selected == "updates" then
+    return has_update(package)
+  elseif selected == "managed" then
+    return package.managed == true
+  end
+  return package.managed ~= true
+end
+
+local function sort_packages(kind, selected, packages)
+  table.sort(packages, function(left, right)
+    if kind == "browse" and selected == "recent" then
+      local left_date = type(left.latest) == "table"
+          and tostring(left.latest.publishedAt or "")
+        or ""
+      local right_date = type(right.latest) == "table"
+          and tostring(right.latest.publishedAt or "")
+        or ""
+      if left_date ~= right_date then
+        return left_date > right_date
+      end
+    elseif kind == "installed" and selected == "updates_first" then
+      local left_update = has_update(left)
+      local right_update = has_update(right)
+      if left_update ~= right_update then
+        return left_update
+      end
+    end
+    return name_before(left, right, selected == "name_desc")
+  end)
+end
+
 function Model.new(page_size)
   return setmetatable({
     catalog = {},
@@ -68,6 +166,10 @@ function Model.new(page_size)
     managerPackage = nil,
     browseSearch = "",
     installedSearch = "",
+    browseSort = "name_asc",
+    installedSort = "name_asc",
+    browseFilter = "all",
+    installedFilter = "all",
     browsePage = 1,
     installedPage = 1,
     pageSize = page_size or 6,
@@ -120,31 +222,81 @@ function Model:set_search(kind, value)
   end
 end
 
+function Model:set_sort(kind, value)
+  if kind == "browse" then
+    if not BROWSE_SORTS[value] then
+      return false
+    end
+    if self.browseSort == value then
+      return false
+    end
+    self.browseSort = value
+    self.browsePage = 1
+    return true
+  elseif kind == "installed" then
+    if not INSTALLED_SORTS[value] then
+      return false
+    end
+    if self.installedSort == value then
+      return false
+    end
+    self.installedSort = value
+    self.installedPage = 1
+    return true
+  end
+  return false
+end
+
+function Model:set_filter(kind, value)
+  if kind == "browse" then
+    if not BROWSE_FILTERS[value] then
+      return false
+    end
+    if self.browseFilter == value then
+      return false
+    end
+    self.browseFilter = value
+    self.browsePage = 1
+    return true
+  elseif kind == "installed" then
+    if not INSTALLED_FILTERS[value] then
+      return false
+    end
+    if self.installedFilter == value then
+      return false
+    end
+    self.installedFilter = value
+    self.installedPage = 1
+    return true
+  end
+  return false
+end
+
 function Model:filtered(kind)
   local list
   local query
+  local selected_filter
+  local selected_sort
   if kind == "browse" then
     list = self.catalog
     query = folded(self.browseSearch)
+    selected_filter = self.browseFilter
+    selected_sort = self.browseSort
   else
     list = self.installed
     query = folded(self.installedSearch)
-  end
-
-  if query == "" then
-    local copy = {}
-    for index, package in ipairs(list) do
-      copy[index] = package
-    end
-    return copy
+    selected_filter = self.installedFilter
+    selected_sort = self.installedSort
   end
 
   local result = {}
   for _, package in ipairs(list) do
-    if package_text(package):find(query, 1, true) then
+    local search_match = query == "" or package_text(package):find(query, 1, true)
+    if search_match and matches_filter(kind, selected_filter, package) then
       result[#result + 1] = package
     end
   end
+  sort_packages(kind, selected_sort, result)
   return result
 end
 

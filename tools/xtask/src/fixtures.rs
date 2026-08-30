@@ -27,10 +27,25 @@ pub fn generate(
     keys: &Path,
     catalog: &Path,
     output: &Path,
-    version: u64,
+    root_version: u64,
+    metadata_version: u64,
     expired: bool,
 ) -> Result<()> {
-    ensure!(version > 0, "fixture metadata version must be positive");
+    ensure!(root_version > 0, "fixture root version must be positive");
+    ensure!(
+        metadata_version > 0,
+        "fixture metadata version must be positive"
+    );
+    if output.exists() {
+        ensure!(
+            fs::read_dir(output)
+                .with_context(|| format!("read {}", output.display()))?
+                .next()
+                .is_none(),
+            "fixture output must be empty: {}",
+            output.display()
+        );
+    }
     let role_keys = load_keys(keys)?;
     let catalog_bytes = fs::read(catalog).with_context(|| format!("read {}", catalog.display()))?;
     let catalog_value: Value =
@@ -52,7 +67,7 @@ pub fn generate(
     } else {
         "2030-01-01T00:00:00Z"
     };
-    let root_signed = root_signed(&role_keys, version);
+    let root_signed = root_signed(&role_keys, root_version);
     let root = signed_envelope(
         root_signed,
         role_keys.get("root").context("missing root fixture key")?,
@@ -63,7 +78,7 @@ pub fn generate(
     let targets_signed = json!({
         "_type": "targets",
         "spec_version": SPEC_VERSION,
-        "version": version,
+        "version": metadata_version,
         "expires": metadata_expiry,
         "targets": {
             "catalog-v1.json": {
@@ -71,7 +86,7 @@ pub fn generate(
                 "hashes": { "sha256": catalog_hash },
                 "custom": {
                     "schemaVersion": 1,
-                    "channel": "private-alpha",
+                    "channel": "bundled-preview",
                     "purpose": PURPOSE
                 }
             }
@@ -88,11 +103,11 @@ pub fn generate(
     let snapshot_signed = json!({
         "_type": "snapshot",
         "spec_version": SPEC_VERSION,
-        "version": version,
+        "version": metadata_version,
         "expires": metadata_expiry,
         "meta": {
             "targets.json": {
-                "version": version,
+                "version": metadata_version,
                 "length": targets_bytes.len(),
                 "hashes": { "sha256": sha256_hex(&targets_bytes) }
             }
@@ -109,11 +124,11 @@ pub fn generate(
     let timestamp_signed = json!({
         "_type": "timestamp",
         "spec_version": SPEC_VERSION,
-        "version": version,
+        "version": metadata_version,
         "expires": metadata_expiry,
         "meta": {
             "snapshot.json": {
-                "version": version,
+                "version": metadata_version,
                 "length": snapshot_bytes.len(),
                 "hashes": { "sha256": sha256_hex(&snapshot_bytes) }
             }
@@ -134,14 +149,17 @@ pub fn generate(
         .with_context(|| format!("create {}", targets_dir.display()))?;
 
     write(&output.join("root.json"), &root_bytes)?;
-    write(&metadata.join(format!("{version}.root.json")), &root_bytes)?;
     write(
-        &metadata.join(format!("{version}.targets.json")),
+        &metadata.join(format!("{root_version}.root.json")),
+        &root_bytes,
+    )?;
+    write(
+        &metadata.join(format!("{metadata_version}.targets.json")),
         &targets_bytes,
     )?;
     write(&metadata.join("targets.json"), &targets_bytes)?;
     write(
-        &metadata.join(format!("{version}.snapshot.json")),
+        &metadata.join(format!("{metadata_version}.snapshot.json")),
         &snapshot_bytes,
     )?;
     write(&metadata.join("snapshot.json"), &snapshot_bytes)?;

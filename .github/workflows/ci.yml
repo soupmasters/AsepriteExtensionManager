@@ -80,6 +80,9 @@ jobs:
         run: |
           cargo run --locked -p xtask -- validate-catalog \
             --schema registry/schema/catalog-v1.schema.json \
+            --catalog registry/catalog-v1.json
+          cargo run --locked -p xtask -- validate-catalog \
+            --schema registry/schema/catalog-v1.schema.json \
             --catalog registry/bundled/targets/catalog-v1.json
           cargo run --locked -p xtask -- validate-catalog \
             --schema registry/schema/catalog-v1.schema.json \
@@ -97,14 +100,21 @@ jobs:
           --root registry/bundled/root.json
           --metadata registry/bundled/metadata
           --targets registry/bundled/targets
+      - name: Verify pinned catalog downloads
+        run: >-
+          cargo test --locked -p aem-helper --test live_github
+          prepares_pinned_curated_catalog_sources -- --ignored --exact
       - name: Verify reproducible fixture metadata
         shell: bash
         run: |
           fixture_output="$(mktemp -d)"
           cargo run --locked -p xtask -- registry-fixtures \
             --keys registry/fixtures/keys \
-            --catalog registry/bundled/targets/catalog-v1.json \
+            --catalog registry/catalog-v1.json \
+            --root-version 1 \
+            --version 3 \
             --output "$fixture_output"
+          cmp registry/catalog-v1.json registry/bundled/targets/catalog-v1.json
           diff --recursive --unified registry/bundled "$fixture_output"
 
   dependency-policy:

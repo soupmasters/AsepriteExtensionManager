@@ -43,6 +43,146 @@ Test.case("browse model searches and paginates catalog packages", function()
   Test.equal(filtered_total, 1)
 end)
 
+Test.case("browse sorting and compatibility filters compose before paging", function()
+  local model = Model.new(1)
+  model:set_catalog({
+    {
+      id = "charlie",
+      displayName = "Charlie",
+      latest = nil,
+    },
+    {
+      id = "alpha",
+      displayName = "alpha",
+      latest = {
+        publishedAt = "2025-01-01T00:00:00Z",
+      },
+    },
+    {
+      id = "beta",
+      displayName = "Beta",
+      latest = {
+        publishedAt = "2026-01-01T00:00:00Z",
+      },
+    },
+  }, "current", false, false)
+
+  local alphabetical = model:filtered("browse")
+  Test.equal(alphabetical[1].id, "alpha")
+  Test.equal(alphabetical[2].id, "beta")
+  Test.equal(alphabetical[3].id, "charlie")
+  Test.equal(model.catalog[1].id, "charlie", "sorting must not mutate catalog order")
+
+  model:move_page("browse", 2)
+  Test.equal(model.browsePage, 3)
+  Test.truthy(model:set_sort("browse", "name_desc"))
+  Test.equal(model.browsePage, 1)
+  local descending = model:filtered("browse")
+  Test.equal(descending[1].id, "charlie")
+  Test.equal(descending[3].id, "alpha")
+
+  Test.truthy(model:set_sort("browse", "recent"))
+  local recent = model:filtered("browse")
+  Test.equal(recent[1].id, "beta")
+  Test.equal(recent[2].id, "alpha")
+  Test.equal(recent[3].id, "charlie")
+
+  model:move_page("browse", 2)
+  Test.truthy(model:set_filter("browse", "compatible"))
+  Test.equal(model.browsePage, 1)
+  local compatible, page, pages, total = model:page("browse")
+  Test.equal(compatible[1].id, "beta")
+  Test.equal(page, 1)
+  Test.equal(pages, 2)
+  Test.equal(total, 2)
+  model:move_page("browse", 1)
+  Test.falsy(model:set_filter("browse", "compatible"))
+  Test.equal(model.browsePage, 2)
+
+  model:set_search("browse", "alpha")
+  local searched = model:filtered("browse")
+  Test.equal(#searched, 1)
+  Test.equal(searched[1].id, "alpha")
+
+  model:set_search("browse", "")
+  Test.truthy(model:set_filter("browse", "unavailable"))
+  local unavailable = model:filtered("browse")
+  Test.equal(#unavailable, 1)
+  Test.equal(unavailable[1].id, "charlie")
+
+  Test.falsy(model:set_filter("browse", "unknown"))
+  Test.equal(model.browseFilter, "unavailable")
+  Test.falsy(model:set_filter("browse", "unavailable"))
+  Test.falsy(model:set_sort("unknown", "name_asc"))
+end)
+
+Test.case("installed sorting and status filters compose before paging", function()
+  local model = Model.new(2)
+  model:set_installed({
+    {
+      name = "zulu",
+      displayName = "Zulu",
+      updateError = {
+        code = "offline",
+      },
+    },
+    {
+      name = "alpha",
+      displayName = "Alpha",
+      managed = true,
+    },
+    {
+      name = "beta",
+      displayName = "Beta",
+      managed = false,
+      update = {
+        version = "2.0.0",
+      },
+    },
+    {
+      name = "delta",
+      displayName = "Delta",
+      managed = true,
+      update = "available",
+    },
+  })
+
+  local alphabetical = model:filtered("installed")
+  Test.equal(alphabetical[1].name, "alpha")
+  Test.equal(alphabetical[4].name, "zulu")
+  Test.equal(model.installed[1].name, "zulu", "sorting must not mutate installed order")
+
+  model:move_page("installed", 1)
+  Test.equal(model.installedPage, 2)
+  Test.truthy(model:set_sort("installed", "updates_first"))
+  Test.equal(model.installedPage, 1)
+  local updates_first = model:filtered("installed")
+  Test.equal(updates_first[1].name, "beta")
+  Test.equal(updates_first[2].name, "delta")
+  Test.equal(updates_first[3].name, "alpha")
+
+  Test.truthy(model:set_filter("installed", "updates"))
+  local updates = model:filtered("installed")
+  Test.equal(#updates, 2)
+  Test.equal(updates[1].name, "beta")
+  Test.equal(updates[2].name, "delta")
+
+  Test.truthy(model:set_filter("installed", "managed"))
+  local managed = model:filtered("installed")
+  Test.equal(#managed, 2)
+  Test.equal(managed[1].name, "delta")
+  Test.equal(managed[2].name, "alpha")
+
+  Test.truthy(model:set_filter("installed", "unmanaged"))
+  model:set_search("installed", "zulu")
+  local unmanaged = model:filtered("installed")
+  Test.equal(#unmanaged, 1)
+  Test.equal(unmanaged[1].name, "zulu")
+  Test.falsy(model:set_sort("installed", "recent"))
+  Test.equal(model.installedSort, "updates_first")
+  Test.falsy(model:set_sort("installed", "updates_first"))
+end)
+
 Test.case("manager is excluded from both package lists regardless of source", function()
   local manager_catalog = {
     id = "ASEPRITE-EXTENSION-MANAGER",
@@ -362,6 +502,133 @@ Test.case("manager uses compact native install and utility controls", function()
   end
 end)
 
+Test.case("sort and filter controls update browse and installed independently", function()
+  local Dialog, dialogs = Fakes.dialog_factory()
+  local model = Model.new(1)
+  model:set_catalog({
+    {
+      id = "zulu-catalog",
+      displayName = "Zulu Catalog",
+      latest = {
+        version = "2.0.0",
+        publishedAt = "2026-01-01T00:00:00Z",
+      },
+    },
+    {
+      id = "alpha-catalog",
+      displayName = "Alpha Catalog",
+    },
+  }, "current", false, false)
+  model:set_installed({
+    {
+      name = "zulu-installed",
+      displayName = "Zulu Installed",
+      version = "1.0.0",
+      managed = true,
+    },
+    {
+      name = "alpha-installed",
+      displayName = "Alpha Installed",
+      version = "1.0.0",
+      managed = false,
+      update = {
+        version = "2.0.0",
+      },
+    },
+  })
+  local ui = Ui.new({
+    app = Fakes.app {
+      allFilesExist = true,
+    },
+    plugin = Fakes.plugin(),
+    Dialog = Dialog,
+  }, model)
+  ui:open {
+    refresh = function() end,
+    install_from_github = function() end,
+    sync_local_folder = function() end,
+    on_dialog_closed = function() end,
+  }
+
+  local manager = dialogs[1]
+  for _, id in ipairs({
+    "browse_filter",
+    "browse_sort",
+    "installed_filter",
+    "installed_sort",
+  }) do
+    Test.equal(manager.widgetsById[id].kind, "combobox")
+    Test.truthy(manager.widgetsById[id].definition.visible)
+  end
+  Test.equal(manager.widgetsById.browse_filter.definition.option, "All")
+  Test.equal(manager.widgetsById.browse_sort.definition.option, "Name A-Z")
+  Test.equal(manager.widgetsById.installed_filter.definition.option, "All")
+  Test.equal(manager.widgetsById.installed_sort.definition.option, "Name A-Z")
+  Test.contains(manager.widgetsById.browse_row_1.definition.text, "Alpha Catalog")
+  Test.contains(manager.widgetsById.installed_row_1.definition.text, "Alpha Installed")
+
+  model:move_page("browse", 1)
+  ui:refresh()
+  Test.equal(manager.widgetsById.browse_page.definition.text, "2 / 2")
+  manager.data.browse_filter = "Compatible"
+  manager.widgetsById.browse_filter.definition.onchange()
+  Test.equal(model.browseFilter, "compatible")
+  Test.equal(model.browsePage, 1)
+  Test.contains(manager.widgetsById.browse_row_1.definition.text, "Zulu Catalog")
+  Test.equal(manager.widgetsById.browse_stacked_filter.definition.option, "Compatible")
+
+  manager.data.browse_sort = "Newest"
+  manager.widgetsById.browse_sort.definition.onchange()
+  Test.equal(model.browseSort, "recent")
+  Test.equal(model.installedSort, "name_asc")
+
+  manager.data.installed_filter = "Updates Available"
+  manager.widgetsById.installed_filter.definition.onchange()
+  Test.equal(model.installedFilter, "updates")
+  Test.contains(manager.widgetsById.installed_row_1.definition.text, "Alpha Installed")
+  Test.equal(model.browseFilter, "compatible")
+
+  manager.data.installed_filter = "All"
+  manager.widgetsById.installed_filter.definition.onchange()
+  manager.data.installed_sort = "Name Z-A"
+  manager.widgetsById.installed_sort.definition.onchange()
+  Test.equal(model.installedSort, "name_desc")
+  Test.contains(manager.widgetsById.installed_row_1.definition.text, "Zulu Installed")
+
+  model:set_catalog({
+    {
+      id = "compatible-only",
+      displayName = "Compatible Only",
+      latest = {
+        version = "1.0.0",
+        publishedAt = "2026-01-01T00:00:00Z",
+      },
+    },
+  }, "current", false, false)
+  model:set_filter("browse", "unavailable")
+  ui:refresh()
+  Test.truthy(manager.widgetsById.browse_empty.definition.visible)
+  Test.equal(
+    manager.widgetsById.browse_empty.definition.text,
+    "No catalog packages match this filter."
+  )
+
+  model:set_search("browse", "missing")
+  ui:refresh()
+  Test.equal(
+    manager.widgetsById.browse_empty.definition.text,
+    "No catalog packages match this search and filter."
+  )
+
+  model.registryExpired = true
+  ui:refresh()
+  Test.equal(
+    manager.widgetsById.browse_empty.definition.text,
+    "No catalog packages match this search and filter. "
+      .. "Catalog metadata is expired. Cached entries are view-only."
+  )
+end)
+
 Test.case("persistent manager update arrow dispatches the hidden self update", function()
   local Dialog, dialogs = Fakes.dialog_factory()
   local model = Model.new(1)
@@ -457,6 +724,12 @@ Test.case("manager package rows switch between wide and narrow layouts", functio
   for _, kind in ipairs({ "browse", "installed" }) do
     Test.truthy(manager.widgetsById[kind .. "_details_1"].definition.visible)
     Test.falsy(manager.widgetsById[kind .. "_stacked_details_1"].definition.visible)
+    Test.truthy(manager.widgetsById[kind .. "_filter"].definition.visible)
+    Test.truthy(manager.widgetsById[kind .. "_sort"].definition.visible)
+    Test.truthy(manager.widgetsById[kind .. "_filter_label"].definition.visible)
+    Test.truthy(manager.widgetsById[kind .. "_sort_label"].definition.visible)
+    Test.falsy(manager.widgetsById[kind .. "_stacked_filter"].definition.visible)
+    Test.falsy(manager.widgetsById[kind .. "_stacked_sort"].definition.visible)
   end
 
   manager:resize(520)
@@ -466,6 +739,12 @@ Test.case("manager package rows switch between wide and narrow layouts", functio
   for _, kind in ipairs({ "browse", "installed" }) do
     Test.falsy(manager.widgetsById[kind .. "_details_1"].definition.visible)
     Test.truthy(manager.widgetsById[kind .. "_stacked_details_1"].definition.visible)
+    Test.falsy(manager.widgetsById[kind .. "_filter"].definition.visible)
+    Test.falsy(manager.widgetsById[kind .. "_sort"].definition.visible)
+    Test.falsy(manager.widgetsById[kind .. "_filter_label"].definition.visible)
+    Test.falsy(manager.widgetsById[kind .. "_sort_label"].definition.visible)
+    Test.truthy(manager.widgetsById[kind .. "_stacked_filter"].definition.visible)
+    Test.truthy(manager.widgetsById[kind .. "_stacked_sort"].definition.visible)
   end
   Test.equal(manager.widgetsById.browse_row_1.definition.text, "browse-package  v1.0.0")
   Test.equal(
@@ -485,6 +764,12 @@ Test.case("manager package rows switch between wide and narrow layouts", functio
   for _, kind in ipairs({ "browse", "installed" }) do
     Test.truthy(manager.widgetsById[kind .. "_details_1"].definition.visible)
     Test.falsy(manager.widgetsById[kind .. "_stacked_details_1"].definition.visible)
+    Test.truthy(manager.widgetsById[kind .. "_filter"].definition.visible)
+    Test.truthy(manager.widgetsById[kind .. "_sort"].definition.visible)
+    Test.truthy(manager.widgetsById[kind .. "_filter_label"].definition.visible)
+    Test.truthy(manager.widgetsById[kind .. "_sort_label"].definition.visible)
+    Test.falsy(manager.widgetsById[kind .. "_stacked_filter"].definition.visible)
+    Test.falsy(manager.widgetsById[kind .. "_stacked_sort"].definition.visible)
   end
 
   manager:resize(520)
@@ -534,7 +819,7 @@ Test.case("compact pagers navigate browse and installed independently", function
   Test.equal(manager.widgetsById.browse_page.definition.text, "2 / 2")
   Test.truthy(manager.widgetsById.browse_previous.definition.enabled)
   Test.falsy(manager.widgetsById.browse_next.definition.enabled)
-  Test.contains(manager.widgetsById.browse_row_1.definition.text, "browse-three")
+  Test.contains(manager.widgetsById.browse_row_1.definition.text, "browse-two")
   Test.equal(manager.widgetsById.installed_page.definition.text, "1 / 2")
 
   manager.widgetsById.browse_previous.definition.onclick()
@@ -546,7 +831,7 @@ Test.case("compact pagers navigate browse and installed independently", function
   Test.equal(manager.widgetsById.installed_page.definition.text, "2 / 2")
   Test.truthy(manager.widgetsById.installed_previous.definition.enabled)
   Test.falsy(manager.widgetsById.installed_next.definition.enabled)
-  Test.contains(manager.widgetsById.installed_row_1.definition.text, "installed-three")
+  Test.contains(manager.widgetsById.installed_row_1.definition.text, "installed-two")
   Test.equal(manager.widgetsById.browse_page.definition.text, "1 / 2")
 
   ui:set_busy(true)
@@ -589,6 +874,10 @@ Test.case("compact pagers remain one native button row without samerow support",
   Test.equal(manager.widgetsById.browse_next.definition.text, "→")
   Test.truthy(manager.widgetsById.browse_details_1.definition.visible)
   Test.falsy(manager.widgetsById.browse_stacked_details_1)
+  Test.truthy(manager.widgetsById.browse_filter.definition.visible)
+  Test.truthy(manager.widgetsById.browse_sort.definition.visible)
+  Test.falsy(manager.widgetsById.browse_stacked_filter)
+  Test.falsy(manager.widgetsById.browse_stacked_sort)
 end)
 
 Test.case("secondary windows are resizable and scroll when space is constrained", function()
@@ -675,11 +964,11 @@ Test.case("installed rows use compact management status symbols", function()
 
   Test.equal(
     dialogs[1].widgetsById.installed_row_1.definition.text,
-    "Linked Package  v1.0.0 · ✓ · Enabled · Update 2.0.0"
+    "External Package  v3.0.0 · ⚠ · Disabled · Update check failed · Restore available"
   )
   Test.equal(
     dialogs[1].widgetsById.installed_row_2.definition.text,
-    "External Package  v3.0.0 · ⚠ · Disabled · Update check failed · Restore available"
+    "Linked Package  v1.0.0 · ✓ · Enabled · Update 2.0.0"
   )
 end)
 

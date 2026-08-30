@@ -1,9 +1,15 @@
 # Registry
 
-## Private-alpha catalog
+## Bundled curated catalog
 
-The private alpha ships an authenticated catalog with zero third-party
-packages. Direct public GitHub and local-folder operations remain available.
+The manager ships a curated preview catalog. The one human-edited source is
+`registry/catalog-v1.json`; authenticated generated copies are stored under
+`registry/bundled` and included in each manager package. Direct public GitHub
+and local-folder operations remain available.
+
+Catalog inclusion is version-specific. It means the exact package bytes or
+repository commit were reviewed and pinned; it is not a blanket endorsement of
+future versions or every action performed by an extension.
 
 The package contains only:
 
@@ -11,10 +17,11 @@ The package contains only:
 registry/
 ├── root.json
 ├── metadata/
+│   ├── 1.root.json
 │   ├── timestamp.json
-│   ├── 1.snapshot.json
+│   ├── 3.snapshot.json
 │   ├── snapshot.json
-│   ├── 1.targets.json
+│   ├── 3.targets.json
 │   └── targets.json
 └── targets/
     ├── <sha256>.catalog-v1.json
@@ -23,11 +30,13 @@ registry/
 
 The versioned metadata and hash-prefixed target implement consistent
 snapshots. Unversioned copies are byte-identical compatibility aliases. The
-packaging validator rejects fixture keys, seeds, and private fixture paths.
+packaging validator verifies the complete signed chain and exact file set, and
+rejects fixture keys, seeds, and private fixture paths.
 
 The committed signing seeds under `registry/fixtures/keys` are deliberately
-public and restricted to tests and private-alpha fixtures. They establish no
-trust for a public catalog.
+public. They make the bundled preview metadata reproducible, but they do not
+establish trust for a network-updated public catalog. The catalog currently
+changes only as part of a reviewed manager release.
 
 ## Catalog schema version 1
 
@@ -38,9 +47,16 @@ case-folded Aseprite manifest `name`. Each package records:
 - manifest identity, display name, author, license, homepage, and repository;
 - stable releases with strict `MAJOR.MINOR.PATCH` versions;
 - minimum and optional maximum Aseprite and scripting API compatibility;
-- an immutable HTTPS asset URL, SHA-256, and byte length;
+- an immutable HTTPS source URL, SHA-256, and byte length;
 - publication time, release notes, and yanked state;
-- optional release tag, asset identifier, or immutable commit identity.
+- either release-asset provenance or an immutable GitHub commit identity.
+
+A release asset must already be a valid root-flat `.aseprite-extension` file.
+A repository snapshot must use the exact canonical GitHub codeload URL for its
+declared repository and 40-character commit. The helper authenticates the
+downloaded source bytes, removes the GitHub wrapper directory, creates a clean
+extension archive, and validates its manifest and contribution paths. Release
+asset metadata and snapshot metadata cannot be mixed.
 
 Yanked releases remain visible to explain existing receipts but cannot be
 selected for new installs or updates.
@@ -56,36 +72,59 @@ accepted versions and enforcing timestamp expiry. A valid last-known-good cache
 can be displayed while offline. Expired metadata can also be displayed with a
 clear stale state, but it cannot authorize catalog installs or updates. Direct
 GitHub and local-folder operations do not depend on catalog freshness.
+Expiry also does not block signature/hash validation of an already-installed
+manager when creating a recovery package or updating the manager itself.
 
-## Fixture maintenance
+## Suggesting an extension
 
-Validate and regenerate the reproducible private-alpha chain with:
+Anyone can use the repository's
+[extension suggestion form](https://github.com/soupmasters/AsepriteExtensionManager/issues/new?template=extension-suggestion.yml).
+Candidates must be public, open-source Aseprite extensions with a root manifest,
+a stable semantic version, valid contribution paths, and no native executable
+content. A published `.aseprite-extension` release asset is preferred; a tagged
+repository snapshot can be accepted after the same source and archive review.
+
+Maintainers verify identity, ownership, license, compatibility, source history,
+archive contents, SHA-256, and byte length before editing
+`registry/catalog-v1.json`. Submissions do not receive automatic inclusion, and
+security reports must use GitHub's private advisory form rather than a public
+catalog issue.
+
+## Bundled metadata maintenance
+
+Validate and regenerate the reproducible bundled chain in a fresh directory:
 
 ```sh
 cargo run --locked -p xtask -- validate-catalog \
   --schema registry/schema/catalog-v1.schema.json \
-  --catalog registry/bundled/targets/catalog-v1.json
+  --catalog registry/catalog-v1.json
 
+fixture_output="$(mktemp -d)"
 cargo run --locked -p xtask -- registry-fixtures \
   --keys registry/fixtures/keys \
-  --catalog registry/bundled/targets/catalog-v1.json \
-  --output registry/bundled
+  --catalog registry/catalog-v1.json \
+  --root-version 1 \
+  --version 3 \
+  --output "$fixture_output"
 
 cargo run --locked -p xtask -- verify-registry-fixtures \
-  --root registry/bundled/root.json \
-  --metadata registry/bundled/metadata \
-  --targets registry/bundled/targets
+  --root "$fixture_output/root.json" \
+  --metadata "$fixture_output/metadata" \
+  --targets "$fixture_output/targets"
+
+diff --recursive --unified registry/bundled "$fixture_output"
 ```
 
-CI regenerates the chain in a temporary directory and compares every byte.
-`--version 2` can create a rotated metadata set in a temporary directory, and
-`--expired` can create a correctly signed expiry fixture. These options are for
-rotation, rollback, freeze, and expiry tests; they are never used for the
-bundled catalog.
+Review the complete diff before replacing `registry/bundled` as a unit, so
+obsolete versioned metadata or hash-prefixed targets cannot survive. Keep the
+root version stable unless its keys, roles, thresholds, or expiry change, and
+increment timestamp, snapshot, and targets versions whenever their signed
+bytes change. `--expired` creates correctly signed expiry fixtures for tests.
 
-## Public signing ceremony
+## Network catalog signing ceremony
 
-Public catalog publication is blocked until a separate signing ceremony:
+Network-updated catalog publication is blocked until a separate signing
+ceremony:
 
 1. Use an offline, freshly prepared system and record the participants,
    software versions, date, and checksums.

@@ -463,6 +463,7 @@ async fn handle_request(context: Arc<Context>, method: Method, params: Value) ->
                             release.asset.byte_length,
                             &registry_package.manifest_name,
                             &release.version,
+                            release.asset.commit.as_deref(),
                         )
                         .await?;
                     reject_self_update(&package)?;

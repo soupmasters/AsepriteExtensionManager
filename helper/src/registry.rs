@@ -496,6 +496,126 @@ impl RegistryClient {
     }
 }
 
+pub fn validate_bundled_repository(repository: &Path) -> RpcResult<()> {
+    validate_bundled_repository_at(repository, Utc::now())
+}
+
+pub(crate) fn validate_bundled_repository_allow_expired(repository: &Path) -> RpcResult<()> {
+    let before_any_supported_expiry = DateTime::<Utc>::from_timestamp(0, 0)
+        .ok_or_else(|| RpcError::internal("could not construct registry validation time"))?;
+    validate_bundled_repository_at(repository, before_any_supported_expiry)
+}
+
+fn validate_bundled_repository_at(repository: &Path, now: DateTime<Utc>) -> RpcResult<()> {
+    let temporary = tempfile::tempdir().map_err(RpcError::io)?;
+    let state = State::new(temporary.path())?;
+    let client = RegistryClient {
+        state,
+        repository: repository.to_path_buf(),
+    };
+    let pinned_root_bytes = fs::read(repository.join("root.json")).map_err(RpcError::io)?;
+    let pinned_root_envelope = parse_envelope(&pinned_root_bytes, "root")?;
+    let pinned_root: RootSigned = parse_signed(&pinned_root_envelope)?;
+    let verified = client.verify_repository(repository, now)?;
+
+    require_alias(
+        &repository.join("metadata/snapshot.json"),
+        &verified.snapshot_bytes,
+        "snapshot.json",
+    )?;
+    require_alias(
+        &repository.join("metadata/targets.json"),
+        &verified.targets_bytes,
+        "targets.json",
+    )?;
+    require_alias(
+        &repository.join("targets/catalog-v1.json"),
+        &verified.catalog_bytes,
+        "catalog-v1.json",
+    )?;
+    require_alias(
+        &repository
+            .join("metadata")
+            .join(format!("{}.root.json", pinned_root.version)),
+        &pinned_root_bytes,
+        "versioned root metadata",
+    )?;
+
+    let mut expected_metadata = BTreeSet::from([
+        "timestamp.json".to_owned(),
+        "snapshot.json".to_owned(),
+        "targets.json".to_owned(),
+        format!("{}.snapshot.json", verified.versions.snapshot),
+        format!("{}.targets.json", verified.versions.targets),
+    ]);
+    for version in pinned_root.version..=verified.versions.root {
+        expected_metadata.insert(format!("{version}.root.json"));
+    }
+    require_exact_directory_files(
+        &repository.join("metadata"),
+        &expected_metadata,
+        "registry metadata",
+    )?;
+
+    let catalog_hash = hex::encode(Sha256::digest(&verified.catalog_bytes));
+    let expected_targets = BTreeSet::from([
+        "catalog-v1.json".to_owned(),
+        format!("{catalog_hash}.catalog-v1.json"),
+    ]);
+    require_exact_directory_files(
+        &repository.join("targets"),
+        &expected_targets,
+        "registry targets",
+    )
+}
+
+fn require_alias(path: &Path, expected: &[u8], name: &str) -> RpcResult<()> {
+    let actual = fs::read(path).map_err(RpcError::io)?;
+    if actual != expected {
+        return Err(tuf_error(
+            "TUF_ALIAS_MISMATCH",
+            format!("{name} is not byte-identical to its authenticated version"),
+        ));
+    }
+    Ok(())
+}
+
+fn require_exact_directory_files(
+    directory: &Path,
+    expected: &BTreeSet<String>,
+    label: &str,
+) -> RpcResult<()> {
+    let mut actual = BTreeSet::new();
+    for entry in fs::read_dir(directory).map_err(RpcError::io)? {
+        let entry = entry.map_err(RpcError::io)?;
+        let file_type = entry.file_type().map_err(RpcError::io)?;
+        if !file_type.is_file() {
+            return Err(tuf_error(
+                "TUF_UNEXPECTED_FILE",
+                format!("{label} contains a non-file entry"),
+            ));
+        }
+        let name = entry.file_name().into_string().map_err(|_| {
+            tuf_error(
+                "TUF_UNEXPECTED_FILE",
+                format!("{label} contains a non-UTF-8 filename"),
+            )
+        })?;
+        actual.insert(name);
+    }
+    if actual != *expected {
+        return Err(tuf_error(
+            "TUF_UNEXPECTED_FILE",
+            format!("{label} files do not match the authenticated chain"),
+        )
+        .with_details(serde_json::json!({
+            "expected": expected,
+            "actual": actual
+        })));
+    }
+    Ok(())
+}
+
 fn parse_envelope(bytes: &[u8], role: &str) -> RpcResult<Envelope> {
     serde_json::from_slice(bytes)
         .map_err(|error| tuf_error("TUF_INVALID_METADATA", format!("{role}: {error}")))
@@ -690,7 +810,7 @@ fn target_path(
     }
 }
 
-fn validate_catalog(catalog: &Catalog) -> RpcResult<()> {
+pub fn validate_catalog(catalog: &Catalog) -> RpcResult<()> {
     if catalog.schema_version != 1 {
         return Err(tuf_error(
             "CATALOG_SCHEMA_UNSUPPORTED",
@@ -774,9 +894,76 @@ fn validate_catalog(catalog: &Catalog) -> RpcResult<()> {
                     "catalog asset URLs must use HTTPS",
                 ));
             }
+            if let Some(commit) = release.asset.commit.as_deref() {
+                if release.asset.release_tag.is_some() || release.asset.asset_id.is_some() {
+                    return Err(tuf_error(
+                        "CATALOG_INVALID",
+                        "catalog repository snapshots cannot declare release asset metadata",
+                    ));
+                }
+                let expected = canonical_github_snapshot_url(&package.repository, commit)
+                    .ok_or_else(|| {
+                        tuf_error(
+                            "CATALOG_INVALID",
+                            "catalog repository snapshots require a canonical GitHub repository and lowercase commit",
+                        )
+                    })?;
+                if release.asset.url != expected {
+                    return Err(tuf_error(
+                        "CATALOG_INVALID",
+                        "catalog snapshot URL does not match its repository and commit",
+                    ));
+                }
+            } else if url.host_str() == Some("codeload.github.com") {
+                return Err(tuf_error(
+                    "CATALOG_INVALID",
+                    "catalog codeload snapshots must declare their immutable commit",
+                ));
+            }
         }
     }
     Ok(())
+}
+
+fn canonical_github_snapshot_url(repository: &str, commit: &str) -> Option<String> {
+    if commit.len() != 40
+        || !commit
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return None;
+    }
+
+    let url = url::Url::parse(repository).ok()?;
+    if url.scheme() != "https"
+        || url.host_str() != Some("github.com")
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.port().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return None;
+    }
+    let segments: Vec<_> = url.path_segments()?.collect();
+    if segments.len() != 2
+        || segments.iter().any(|segment| {
+            segment.is_empty()
+                || !segment
+                    .chars()
+                    .all(|character| character.is_ascii_alphanumeric() || "-._".contains(character))
+        })
+    {
+        return None;
+    }
+    let canonical_repository = format!("https://github.com/{}/{}", segments[0], segments[1]);
+    if repository != canonical_repository {
+        return None;
+    }
+    Some(format!(
+        "https://codeload.github.com/{}/{}/zip/{commit}",
+        segments[0], segments[1]
+    ))
 }
 
 fn decode_key(value: &str) -> RpcResult<Vec<u8>> {
@@ -1041,6 +1228,62 @@ mod tests {
         assert!(validate_catalog(&catalog).is_err());
     }
 
+    fn snapshot_catalog() -> Catalog {
+        let commit = "1".repeat(40);
+        Catalog {
+            schema_version: 1,
+            generated_at: Utc::now(),
+            packages: vec![CatalogPackage {
+                id: "sample".to_owned(),
+                manifest_name: "sample".to_owned(),
+                display_name: "Sample".to_owned(),
+                summary: String::new(),
+                author: serde_json::json!({"name":"Author"}),
+                license: "MIT".to_owned(),
+                homepage: "https://example.com".to_owned(),
+                repository: "https://github.com/example/sample".to_owned(),
+                releases: vec![CatalogRelease {
+                    version: "1.2.3".to_owned(),
+                    aseprite: AsepriteCompatibility {
+                        minimum_version: "1.3.15".to_owned(),
+                        maximum_version: None,
+                        minimum_api: 35,
+                        maximum_api: None,
+                    },
+                    asset: CatalogAsset {
+                        url: format!("https://codeload.github.com/example/sample/zip/{commit}"),
+                        sha256: "0".repeat(64),
+                        byte_length: 1,
+                        release_tag: None,
+                        asset_id: None,
+                        commit: Some(commit),
+                    },
+                    published_at: Utc::now(),
+                    release_notes: String::new(),
+                    yanked: false,
+                }],
+            }],
+        }
+    }
+
+    #[test]
+    fn catalog_snapshots_require_canonical_repository_commit_urls() {
+        let catalog = snapshot_catalog();
+        validate_catalog(&catalog).unwrap();
+
+        let mut wrong_repository = catalog.clone();
+        wrong_repository.packages[0].repository = "https://github.com/other/sample".to_owned();
+        assert!(validate_catalog(&wrong_repository).is_err());
+
+        let mut release_metadata = catalog.clone();
+        release_metadata.packages[0].releases[0].asset.release_tag = Some("v1.2.3".to_owned());
+        assert!(validate_catalog(&release_metadata).is_err());
+
+        let mut missing_commit = catalog;
+        missing_commit.packages[0].releases[0].asset.commit = None;
+        assert!(validate_catalog(&missing_commit).is_err());
+    }
+
     #[test]
     fn parses_committed_catalog_schema_and_enforces_compatibility() {
         let path = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -1117,8 +1360,17 @@ mod tests {
             .unwrap()
             .with_timezone(&Utc);
         let verified = client.verify_repository(&repository, now).unwrap();
-        assert_eq!(verified.versions.targets, 1);
-        assert!(verified.catalog.packages.is_empty());
+        assert_eq!(verified.versions.root, 1);
+        assert_eq!(verified.versions.timestamp, 3);
+        assert_eq!(verified.versions.snapshot, 3);
+        assert_eq!(verified.versions.targets, 3);
+        assert_eq!(verified.catalog.packages.len(), 6);
+        assert_eq!(verified.catalog.packages[0].id, "attachment-system");
+        assert_eq!(verified.catalog.packages[1].id, "unity-animation-event");
+        assert_eq!(verified.catalog.packages[2].id, "mcskin-viewer");
+        assert_eq!(verified.catalog.packages[3].id, "mask-like-extension");
+        assert_eq!(verified.catalog.packages[4].id, "shifty");
+        assert_eq!(verified.catalog.packages[5].id, "aseprite-chinese");
 
         let target = fs::read_dir(repository.join("targets"))
             .unwrap()
@@ -1141,6 +1393,46 @@ mod tests {
     }
 
     #[test]
+    fn packaged_registry_requires_exact_chain_files_and_aliases() {
+        let temporary = tempfile::tempdir().unwrap();
+        let repository = temporary.path().join("repository");
+        copy_directory(&bundled_repository(), &repository);
+        validate_bundled_repository(&repository).unwrap();
+        let after_expiry = DateTime::parse_from_rfc3339("2031-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        assert_eq!(
+            validate_bundled_repository_at(&repository, after_expiry)
+                .expect_err("release validation enforces expiry")
+                .code,
+            "TUF_EXPIRED"
+        );
+        validate_bundled_repository_allow_expired(&repository)
+            .expect("recovery validation permits an authenticated expired chain");
+
+        fs::copy(
+            repository.join("metadata/3.snapshot.json"),
+            repository.join("metadata/03.snapshot.json"),
+        )
+        .unwrap();
+        assert_eq!(
+            validate_bundled_repository(&repository)
+                .expect_err("noncanonical metadata filename")
+                .code,
+            "TUF_UNEXPECTED_FILE"
+        );
+
+        fs::remove_file(repository.join("metadata/03.snapshot.json")).unwrap();
+        fs::write(repository.join("metadata/snapshot.json"), b"{}").unwrap();
+        assert_eq!(
+            validate_bundled_repository(&repository)
+                .expect_err("mismatched metadata alias")
+                .code,
+            "TUF_ALIAS_MISMATCH"
+        );
+    }
+
+    #[test]
     fn enforces_expiry_and_version_rollback() {
         let temporary = tempfile::tempdir().unwrap();
         let repository = temporary.path().join("repository");
@@ -1159,9 +1451,9 @@ mod tests {
 
         let versions = TrustedVersions {
             root: 1,
-            timestamp: 2,
-            snapshot: 2,
-            targets: 2,
+            timestamp: 4,
+            snapshot: 4,
+            targets: 4,
         };
         atomic_write(
             &client.state.tuf_path("trusted-versions.json"),

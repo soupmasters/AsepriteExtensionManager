@@ -1,0 +1,4 @@
+# Catalogue trust and publication changes require review by the maintainer.
+/registry/ @martincalander
+/helper/src/registry.rs @martincalander
+/.github/workflows/ @martincalander

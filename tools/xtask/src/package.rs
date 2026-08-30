@@ -24,9 +24,7 @@ const REQUIRED_FILES: &[&str] = &[
     "bin/linux/aem-helper",
     "registry/root.json",
     "registry/metadata/timestamp.json",
-    "registry/metadata/1.snapshot.json",
     "registry/metadata/snapshot.json",
-    "registry/metadata/1.targets.json",
     "registry/metadata/targets.json",
     "registry/targets/catalog-v1.json",
 ];
@@ -142,7 +140,12 @@ fn validate_directory(root: &Path) -> Result<()> {
     }
 
     let manifest_bytes = fs::read(root.join("package.json")).context("read package.json")?;
-    validate_manifest(&manifest_bytes, &names).map(|_| ())
+    let version = validate_manifest(&manifest_bytes, &names)?;
+    aem_helper::package::validate_manager_directory(root, &version)
+        .map_err(|error| anyhow::anyhow!("runtime manager validation failed: {error}"))?;
+    aem_helper::registry::validate_bundled_repository(&root.join("registry"))
+        .map_err(|error| anyhow::anyhow!("bundled registry validation failed: {error}"))?;
+    Ok(())
 }
 
 fn validate_archive(path: &Path) -> Result<()> {
@@ -271,6 +274,18 @@ fn validate_names(names: &BTreeSet<&str>) -> Result<()> {
         names.iter().any(|name| is_consistent_catalog_target(name)),
         "missing hash-prefixed catalog target"
     );
+    ensure!(
+        names
+            .iter()
+            .any(|name| is_versioned_metadata(name, "snapshot")),
+        "missing versioned snapshot metadata"
+    );
+    ensure!(
+        names
+            .iter()
+            .any(|name| is_versioned_metadata(name, "targets")),
+        "missing versioned targets metadata"
+    );
     Ok(())
 }
 
@@ -298,6 +313,16 @@ fn is_consistent_catalog_target(name: &str) -> bool {
         && hash
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn is_versioned_metadata(name: &str, role: &str) -> bool {
+    let Some(filename) = name.strip_prefix("registry/metadata/") else {
+        return false;
+    };
+    let Some(version) = filename.strip_suffix(&format!(".{role}.json")) else {
+        return false;
+    };
+    version.parse::<u64>().is_ok_and(|value| value > 0)
 }
 
 fn is_helper(name: &str) -> bool {
@@ -532,6 +557,7 @@ mod tests {
     };
 
     use tempfile::tempdir;
+    use walkdir::WalkDir;
     use zip::{write::SimpleFileOptions, ZipArchive, ZipWriter};
 
     use super::{
@@ -651,25 +677,29 @@ mod tests {
             .contains("runtime manager validation failed"));
     }
 
+    fn copy_test_registry(destination: &Path) {
+        let source = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("registry")
+            .join("bundled");
+        for entry in WalkDir::new(&source) {
+            let entry = entry.unwrap();
+            let relative = entry.path().strip_prefix(&source).unwrap();
+            let target = destination.join(relative);
+            if entry.file_type().is_dir() {
+                fs::create_dir_all(&target).unwrap();
+            } else {
+                fs::copy(entry.path(), target).unwrap();
+            }
+        }
+    }
+
     fn create_minimal_tree(root: &Path) {
         let files = [
             ("main.lua", b"return {}\n".as_slice()),
             ("bin/windows/aem-helper.exe", b"MZ-windows".as_slice()),
             ("bin/linux/aem-helper", b"\x7fELF-linux".as_slice()),
-            ("registry/root.json", b"{}".as_slice()),
-            ("registry/metadata/timestamp.json", b"{}".as_slice()),
-            ("registry/metadata/1.snapshot.json", b"{}".as_slice()),
-            ("registry/metadata/snapshot.json", b"{}".as_slice()),
-            ("registry/metadata/1.targets.json", b"{}".as_slice()),
-            ("registry/metadata/targets.json", b"{}".as_slice()),
-            (
-                "registry/targets/catalog-v1.json",
-                br#"{"schemaVersion":1,"packages":[]}"#.as_slice(),
-            ),
-            (
-                "registry/targets/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef.catalog-v1.json",
-                br#"{"schemaVersion":1,"packages":[]}"#.as_slice(),
-            ),
         ];
         for (relative, bytes) in files {
             let path = root.join(relative);
@@ -693,6 +723,7 @@ mod tests {
             }"#,
         )
         .unwrap();
+        copy_test_registry(&root.join("registry"));
     }
 
     fn universal_macos_fixture() -> Vec<u8> {

@@ -58,7 +58,7 @@ enum Command {
         #[arg(long)]
         catalog: PathBuf,
     },
-    /// Generate signed metadata for the committed private-alpha fixtures.
+    /// Generate reproducible metadata for the bundled preview catalog.
     RegistryFixtures {
         #[arg(long)]
         keys: PathBuf,
@@ -66,9 +66,12 @@ enum Command {
         catalog: PathBuf,
         #[arg(long)]
         output: PathBuf,
-        /// Metadata version for rotation and rollback fixtures.
+        /// Timestamp, snapshot, and targets metadata version.
         #[arg(long, default_value_t = 1)]
         version: u64,
+        /// Trusted root metadata version. Keep this stable unless the root changes.
+        #[arg(long, default_value_t = 1)]
+        root_version: u64,
         /// Produce correctly signed but expired top-level metadata.
         #[arg(long)]
         expired: bool,
@@ -114,8 +117,9 @@ fn main() -> Result<()> {
             catalog,
             output,
             version,
+            root_version,
             expired,
-        } => fixtures::generate(&keys, &catalog, &output, version, expired),
+        } => fixtures::generate(&keys, &catalog, &output, root_version, version, expired),
         Command::VerifyRegistryFixtures {
             root,
             metadata,

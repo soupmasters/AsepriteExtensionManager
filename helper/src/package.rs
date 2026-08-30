@@ -35,9 +35,7 @@ const MANAGER_REQUIRED_FILES: &[&str] = &[
     MANAGER_LINUX_HELPER,
     "registry/root.json",
     "registry/metadata/timestamp.json",
-    "registry/metadata/1.snapshot.json",
     "registry/metadata/snapshot.json",
-    "registry/metadata/1.targets.json",
     "registry/metadata/targets.json",
     "registry/targets/catalog-v1.json",
 ];
@@ -240,6 +238,7 @@ fn validate_manager_directory_with_kind(
     })?)
     .map_err(|error| RpcError::invalid("INVALID_MANIFEST", error.to_string()))?;
     validate_manager_layout(&manifest, &names, expected_version)?;
+    validate_manager_registry(&root.join("registry"), kind)?;
     Ok(manifest)
 }
 
@@ -749,6 +748,7 @@ fn validate_manager_archive_with_kind(
     let mut manifest_bytes = None;
     let mut manifest_count = 0_usize;
     let mut total = 0_u64;
+    let registry_directory = tempfile::tempdir().map_err(RpcError::io)?;
     for index in 0..archive.len() {
         let mut file = archive.by_index(index).map_err(zip_error)?;
         validate_zip_entry_type(&file)?;
@@ -779,6 +779,13 @@ fn validate_manager_archive_with_kind(
         let mut data = Vec::with_capacity(file.size().min(MAX_FILE_BYTES) as usize);
         file.read_to_end(&mut data).map_err(map_zip_read_error)?;
         validate_manager_file(&normalized, &data, kind)?;
+        if normalized.starts_with("registry/") {
+            let destination = registry_directory.path().join(&normalized);
+            if let Some(parent) = destination.parent() {
+                fs::create_dir_all(parent).map_err(RpcError::io)?;
+            }
+            fs::write(destination, &data).map_err(RpcError::io)?;
+        }
         if normalized == "package.json" {
             manifest_count += 1;
             manifest_bytes = Some(data);
@@ -801,7 +808,17 @@ fn validate_manager_archive_with_kind(
     })?)
     .map_err(|error| RpcError::invalid("INVALID_MANIFEST", error.to_string()))?;
     validate_manager_layout(&manifest, &files, expected_version)?;
+    validate_manager_registry(&registry_directory.path().join("registry"), kind)?;
     Ok(manifest)
+}
+
+fn validate_manager_registry(repository: &Path, kind: ManagerValidationKind) -> RpcResult<()> {
+    match kind {
+        ManagerValidationKind::Release => crate::registry::validate_bundled_repository(repository),
+        ManagerValidationKind::Recovery => {
+            crate::registry::validate_bundled_repository_allow_expired(repository)
+        }
+    }
 }
 
 fn validate_manager_layout(
@@ -866,6 +883,24 @@ fn validate_manager_layout(
         return Err(RpcError::invalid(
             "INVALID_MANAGER_PACKAGE",
             "manager package is missing its hash-prefixed catalog target",
+        ));
+    }
+    if !files
+        .iter()
+        .any(|path| is_versioned_metadata(path, "snapshot"))
+    {
+        return Err(RpcError::invalid(
+            "INVALID_MANAGER_PACKAGE",
+            "manager package is missing versioned snapshot metadata",
+        ));
+    }
+    if !files
+        .iter()
+        .any(|path| is_versioned_metadata(path, "targets"))
+    {
+        return Err(RpcError::invalid(
+            "INVALID_MANAGER_PACKAGE",
+            "manager package is missing versioned targets metadata",
         ));
     }
 
@@ -1056,6 +1091,16 @@ fn is_hash_prefixed_catalog(path: &str) -> bool {
         && hash
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn is_versioned_metadata(path: &str, role: &str) -> bool {
+    let Some(filename) = path.strip_prefix("registry/metadata/") else {
+        return false;
+    };
+    let Some(version) = filename.strip_suffix(&format!(".{role}.json")) else {
+        return false;
+    };
+    version.parse::<u64>().is_ok_and(|value| value > 0)
 }
 
 fn contains_private_registry_material(path: &str) -> bool {
@@ -1480,14 +1525,25 @@ mod tests {
         binary
     }
 
+    fn copy_test_registry(destination: &Path) {
+        let source = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("registry")
+            .join("bundled");
+        for entry in WalkDir::new(&source) {
+            let entry = entry.expect("registry entry");
+            let relative = entry.path().strip_prefix(&source).expect("relative path");
+            let target = destination.join(relative);
+            if entry.file_type().is_dir() {
+                fs::create_dir_all(&target).expect("registry directory");
+            } else {
+                fs::copy(entry.path(), target).expect("registry file");
+            }
+        }
+    }
+
     fn write_manager_fixture(root: &Path, version: &str) {
-        for directory in [
-            "bin/macos",
-            "bin/windows",
-            "bin/linux",
-            "registry/metadata",
-            "registry/targets",
-        ] {
+        for directory in ["bin/macos", "bin/windows", "bin/linux"] {
             fs::create_dir_all(root.join(directory)).expect("manager directory");
         }
         write_manager_manifest(
@@ -1501,23 +1557,7 @@ mod tests {
             .expect("macOS helper");
         fs::write(root.join(MANAGER_WINDOWS_HELPER), b"MZwindows").expect("Windows helper");
         fs::write(root.join(MANAGER_LINUX_HELPER), b"\x7fELFlinux").expect("Linux helper");
-        for path in [
-            "registry/root.json",
-            "registry/metadata/timestamp.json",
-            "registry/metadata/1.snapshot.json",
-            "registry/metadata/snapshot.json",
-            "registry/metadata/1.targets.json",
-            "registry/metadata/targets.json",
-            "registry/targets/catalog-v1.json",
-        ] {
-            fs::write(root.join(path), b"{}").expect("registry file");
-        }
-        fs::write(
-            root.join("registry/targets")
-                .join(format!("{}.catalog-v1.json", "a".repeat(64))),
-            b"{}",
-        )
-        .expect("consistent catalog");
+        copy_test_registry(&root.join("registry"));
     }
 
     #[test]
@@ -1653,12 +1693,17 @@ mod tests {
 
         let missing_consistent_catalog = temporary.path().join("missing-consistent-catalog");
         write_manager_fixture(&missing_consistent_catalog, "1.2.3");
-        fs::remove_file(
-            missing_consistent_catalog
-                .join("registry/targets")
-                .join(format!("{}.catalog-v1.json", "a".repeat(64))),
-        )
-        .expect("remove consistent catalog");
+        let consistent_catalog = fs::read_dir(missing_consistent_catalog.join("registry/targets"))
+            .expect("catalog targets")
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .find(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name != "catalog-v1.json")
+            })
+            .expect("consistent catalog target");
+        fs::remove_file(consistent_catalog).expect("remove consistent catalog");
         assert_eq!(
             validate_manager_directory(&missing_consistent_catalog, "1.2.3")
                 .expect_err("consistent catalog")

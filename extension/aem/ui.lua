@@ -13,6 +13,33 @@ local POINTER_CURSOR = MouseCursor and MouseCursor.POINTER or nil
 local RESIZE_DEBOUNCE_SECONDS = 0.1
 local FALLBACK_INLINE_WIDTH = 560
 local WIDTH_PRESERVING_AUTOFIT = Align and Align.TOP or 0
+local VIEW_OPTIONS = {
+  browse = {
+    filter = {
+      { label = "All", value = "all" },
+      { label = "Compatible", value = "compatible" },
+      { label = "No Compatible Release", value = "unavailable" },
+    },
+    sort = {
+      { label = "Name A-Z", value = "name_asc" },
+      { label = "Name Z-A", value = "name_desc" },
+      { label = "Newest", value = "recent" },
+    },
+  },
+  installed = {
+    filter = {
+      { label = "All", value = "all" },
+      { label = "Updates Available", value = "updates" },
+      { label = "Managed", value = "managed" },
+      { label = "Unmanaged", value = "unmanaged" },
+    },
+    sort = {
+      { label = "Name A-Z", value = "name_asc" },
+      { label = "Name Z-A", value = "name_desc" },
+      { label = "Updates First", value = "updates_first" },
+    },
+  },
+}
 
 local function text(value, fallback)
   if value == nil or value == "" then
@@ -200,6 +227,95 @@ local function dialog_dimension(dialog, property, dimension)
     return nil
   end
   return value
+end
+
+local function option_labels(options)
+  local labels = {}
+  for index, option in ipairs(options) do
+    labels[index] = option.label
+  end
+  return labels
+end
+
+local function option_label(options, value)
+  for _, option in ipairs(options) do
+    if option.value == value then
+      return option.label
+    end
+  end
+  return options[1].label
+end
+
+local function option_value(options, label)
+  for _, option in ipairs(options) do
+    if option.label == label then
+      return option.value
+    end
+  end
+  return nil
+end
+
+local function view_value(model, kind, field)
+  local prefix = kind == "browse" and "browse" or "installed"
+  local suffix = field == "filter" and "Filter" or "Sort"
+  return model[prefix .. suffix]
+end
+
+local function add_view_controls(ui, dialog, kind, supports_same_row)
+  local options = VIEW_OPTIONS[kind]
+
+  local function add_combobox(field, id, visible, label)
+    local choices = options[field]
+    dialog:combobox {
+      id = id,
+      label = label,
+      options = option_labels(choices),
+      option = option_label(choices, view_value(ui.model, kind, field)),
+      visible = visible,
+      hexpand = true,
+      onchange = function()
+        local selected = option_value(choices, dialog.data[id])
+        local changed
+        if field == "filter" then
+          changed = ui.model:set_filter(kind, selected)
+        else
+          changed = ui.model:set_sort(kind, selected)
+        end
+        if changed then
+          ui:refresh()
+        end
+      end,
+    }
+  end
+
+  if supports_same_row then
+    dialog:label {
+      id = kind .. "_filter_label",
+      text = "Filter:",
+      hexpand = false,
+    }
+    dialog:samerow()
+    add_combobox("filter", kind .. "_filter", true)
+    dialog:samerow()
+    dialog:label {
+      id = kind .. "_sort_label",
+      text = "Sort:",
+      hexpand = false,
+    }
+    dialog:samerow()
+    add_combobox("sort", kind .. "_sort", true)
+  else
+    add_combobox("filter", kind .. "_filter", true, "Filter:")
+    add_combobox("sort", kind .. "_sort", true, "Sort:")
+  end
+  dialog:newrow()
+
+  if supports_same_row then
+    add_combobox("filter", kind .. "_stacked_filter", false, "Filter:")
+    dialog:newrow()
+    add_combobox("sort", kind .. "_stacked_sort", false, "Sort:")
+    dialog:newrow()
+  end
 end
 
 local function add_pager(ui, dialog, kind, supports_same_row)
@@ -434,6 +550,40 @@ function Ui:_update_row_controls(kind, index)
   end
 end
 
+function Ui:_update_view_controls(kind)
+  local dialog = self.dialog
+  if not dialog then
+    return
+  end
+  local stacked = self.supportsSameRow and self.rowsStacked
+  local options = VIEW_OPTIONS[kind]
+  if self.supportsSameRow then
+    dialog:modify {
+      id = kind .. "_filter_label",
+      visible = not stacked,
+    }
+    dialog:modify {
+      id = kind .. "_sort_label",
+      visible = not stacked,
+    }
+  end
+  for _, field in ipairs({ "filter", "sort" }) do
+    local selected = option_label(options[field], view_value(self.model, kind, field))
+    dialog:modify {
+      id = kind .. "_" .. field,
+      option = selected,
+      visible = not stacked,
+    }
+    if self.supportsSameRow then
+      dialog:modify {
+        id = kind .. "_stacked_" .. field,
+        option = selected,
+        visible = stacked,
+      }
+    end
+  end
+end
+
 function Ui:_apply_row_layout(stacked, current_width)
   if not self.responsiveReady or not self.supportsSameRow or not self.dialog then
     return
@@ -444,6 +594,7 @@ function Ui:_apply_row_layout(stacked, current_width)
   end
   self.rowsStacked = stacked
   for _, kind in ipairs({ "browse", "installed" }) do
+    self:_update_view_controls(kind)
     for index = 1, self.model.pageSize do
       self:_update_row_controls(kind, index)
     end
@@ -584,6 +735,7 @@ function Ui:_build()
       self:refresh()
     end,
   }
+  add_view_controls(self, dialog, "browse", self.supportsSameRow)
   dialog:label {
     id = "browse_empty",
     text = "",
@@ -645,6 +797,7 @@ function Ui:_build()
       self:refresh()
     end,
   }
+  add_view_controls(self, dialog, "installed", self.supportsSameRow)
   dialog:label {
     id = "installed_empty",
     text = "No user extensions were found.",
@@ -830,20 +983,30 @@ function Ui:refresh()
   local browse, browse_page, browse_pages, browse_count = self.model:page("browse")
   self.browseRows = browse
   local empty_message
-  if self.model.registryExpired then
-    empty_message = "Catalog metadata is expired. Cached entries are view-only."
-  elseif browse_count == 0 and self.model.browseSearch ~= "" then
+  local browse_has_search = self.model.browseSearch ~= ""
+  local browse_has_filter = self.model.browseFilter ~= "all"
+  if browse_count == 0 and browse_has_search and browse_has_filter then
+    empty_message = "No catalog packages match this search and filter."
+  elseif browse_count == 0 and browse_has_search then
     empty_message = "No catalog packages match this search."
+  elseif browse_count == 0 and browse_has_filter then
+    empty_message = "No catalog packages match this filter."
   elseif browse_count == 0 then
     empty_message = "Catalog is empty. Use Install… to add an extension."
   else
     empty_message = ""
+  end
+  if self.model.registryExpired then
+    local expired_message = "Catalog metadata is expired. Cached entries are view-only."
+    empty_message = empty_message == "" and expired_message
+      or empty_message .. " " .. expired_message
   end
   dialog:modify {
     id = "browse_empty",
     text = empty_message,
     visible = empty_message ~= "",
   }
+  self:_update_view_controls("browse")
   for index = 1, self.model.pageSize do
     self:_update_row_controls("browse", index)
   end
@@ -859,12 +1022,24 @@ function Ui:refresh()
   local installed, installed_page, installed_pages, installed_count = self.model:page("installed")
   self.installedRows = installed
   local installed_empty = installed_count == 0
+  local installed_has_search = self.model.installedSearch ~= ""
+  local installed_has_filter = self.model.installedFilter ~= "all"
+  local installed_empty_message
+  if installed_has_search and installed_has_filter then
+    installed_empty_message = "No installed extensions match this search and filter."
+  elseif installed_has_search then
+    installed_empty_message = "No installed extensions match this search."
+  elseif installed_has_filter then
+    installed_empty_message = "No installed extensions match this filter."
+  else
+    installed_empty_message = "No user extensions were found."
+  end
   dialog:modify {
     id = "installed_empty",
-    text = self.model.installedSearch ~= "" and "No installed extensions match this search."
-      or "No user extensions were found.",
+    text = installed_empty_message,
     visible = installed_empty,
   }
+  self:_update_view_controls("installed")
   for index = 1, self.model.pageSize do
     self:_update_row_controls("installed", index)
   end

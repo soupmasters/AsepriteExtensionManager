@@ -7,13 +7,14 @@ Aseprite process. The profile root comes from `app.fs.userConfigPath`; the
 location of the Aseprite application and its store or distribution channel are
 irrelevant.
 
-The private alpha has three runtime parts:
+The manager has three runtime parts:
 
 1. `extension/` contains the Lua entry point, native dialogs, preferences, and
    the WebSocket client.
 2. `aem-helper` performs network, archive, hashing, cache, receipt, catalog, and
    local-folder operations.
-3. `registry/bundled` contains a pinned root and an authenticated empty catalog.
+3. `registry/bundled` contains a pinned root and the authenticated curated
+   catalog generated from `registry/catalog-v1.json`.
 
 The packaged helpers are selected by the Lua layer:
 

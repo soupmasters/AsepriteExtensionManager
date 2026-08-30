@@ -1,6 +1,6 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
-  "$id": "https://github.com/martincalander/aseprite-extension-manager/blob/main/registry/schema/catalog-v1.schema.json",
+  "$id": "https://github.com/soupmasters/AsepriteExtensionManager/blob/master/registry/schema/catalog-v1.schema.json",
   "title": "Aseprite Extension Manager Catalog",
   "type": "object",
   "additionalProperties": false,
@@ -169,9 +169,40 @@
             },
             "commit": {
               "type": "string",
-              "pattern": "^[a-f0-9]{40}$"
+              "pattern": "^[a-f0-9]{40}$",
+              "description": "Immutable GitHub commit for a normalized repository snapshot."
             }
-          }
+          },
+          "allOf": [
+            {
+              "if": {
+                "required": [
+                  "commit"
+                ]
+              },
+              "then": {
+                "properties": {
+                  "url": {
+                    "pattern": "^https://codeload\\.github\\.com/[A-Za-z0-9._-]+/[A-Za-z0-9._-]+/zip/[a-f0-9]{40}$"
+                  }
+                },
+                "not": {
+                  "anyOf": [
+                    {
+                      "required": [
+                        "releaseTag"
+                      ]
+                    },
+                    {
+                      "required": [
+                        "assetId"
+                      ]
+                    }
+                  ]
+                }
+              }
+            }
+          ]
         },
         "publishedAt": {
           "type": "string",

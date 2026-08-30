@@ -1,4 +1,4 @@
-# Private-alpha acceptance
+# Preview acceptance
 
 Alpha completion requires passing automated CI on macOS, Windows, and Linux and
 one full macOS Aseprite run. It does not claim manual Aseprite certification on
@@ -49,10 +49,11 @@ profile for destructive failure simulations.
    exactly the command-execution and localhost WebSocket permissions. Confirm
    no blanket permission is requested.
 3. Confirm the resizable nonmodal dialog uses native widgets, Browse shows the
-   empty private-alpha explanation, and Installed shows unmanaged extensions
-   without modifying them.
-4. Install a real public repository snapshot with one valid root manifest.
-   Confirm the receipt records an immutable commit and exact artifact hash.
+   curated catalog, and Installed shows unmanaged extensions without modifying
+   them.
+4. Install one curated release asset and one curated repository snapshot.
+   Confirm both exact source hashes are authenticated, the snapshot records its
+   immutable commit, and each installed receipt records the correct source.
 5. Install a direct release-style fixture. Exercise the multiple-asset chooser
    and cancel once before selecting explicitly.
 6. Update between two fixture versions. Confirm extension preferences survive,

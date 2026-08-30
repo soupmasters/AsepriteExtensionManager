@@ -1,7 +1,8 @@
+mod platform;
 mod profile;
 
 use std::fs;
-use std::io::{self, IsTerminal, Write};
+use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
 use aem_helper::github::{GitHubClient, ResolveOptions, ResolveResult};
@@ -14,6 +15,7 @@ use aem_helper::state::State;
 use aem_helper::{tooling, VERSION};
 use chrono::Utc;
 use clap::{Parser, Subcommand};
+use platform::AsepriteApplication;
 use profile::{ProfilePaths, MANAGER_NAME};
 use semver::Version;
 use serde_json::Value;
@@ -87,7 +89,7 @@ pub async fn run() -> RpcResult<()> {
     let cli = Cli::parse();
     let custom_profile = cli.user_config.is_some()
         || std::env::var_os("ASEPRITE_USER_FOLDER").is_some_and(|value| !value.is_empty());
-    let aseprite_executable = resolve_aseprite_executable(cli.aseprite)?;
+    let aseprite_application = platform::resolve_application(cli.aseprite)?;
     let paths = ProfilePaths::resolve(
         cli.user_config,
         cli.extension_root,
@@ -102,7 +104,7 @@ pub async fn run() -> RpcResult<()> {
         } => {
             if !prepare_only {
                 require_interactive_install()?;
-                if custom_profile && aseprite_executable.is_none() {
+                if custom_profile && aseprite_application.is_none() {
                     return Err(RpcError::invalid(
                         "ASEPRITE_EXECUTABLE_REQUIRED",
                         "installing into a custom profile also requires --aseprite PATH so the package opens in the matching Aseprite installation",
@@ -115,8 +117,9 @@ pub async fn run() -> RpcResult<()> {
                 asset,
                 prepare_only,
                 &SystemInstaller {
-                    executable: aseprite_executable,
+                    application: aseprite_application,
                     user_config: paths.user_config.clone(),
+                    isolated_profile: custom_profile,
                 },
             )
             .await
@@ -132,42 +135,23 @@ trait NativeInstaller {
 }
 
 struct SystemInstaller {
-    executable: Option<PathBuf>,
+    application: Option<AsepriteApplication>,
     user_config: PathBuf,
+    isolated_profile: bool,
 }
 
 impl NativeInstaller for SystemInstaller {
     fn install(&self, artifact: &Path, package: &PreparedPackage) -> RpcResult<()> {
         require_interactive_install()?;
-        if let Some(executable) = &self.executable {
-            std::process::Command::new(executable)
-                .env("ASEPRITE_USER_FOLDER", &self.user_config)
-                .arg(artifact)
-                .spawn()
-                .map_err(|error| {
-                    RpcError::invalid(
-                        "ASEPRITE_OPEN_FAILED",
-                        format!("could not start the selected Aseprite executable: {error}"),
-                    )
-                })?;
-        } else {
-            opener::open(artifact).map_err(|error| {
-                RpcError::invalid(
-                    "ASEPRITE_OPEN_FAILED",
-                    format!("could not open the prepared package in Aseprite: {error}"),
-                )
-            })?;
-        }
-        let name = safe_terminal_text(display_name(package));
-        let version = safe_terminal_text(&package.version);
-        print!(
-            "Confirm {} {} in Aseprite, then press Enter here to verify it... ",
-            name, version
-        );
-        io::stdout().flush().map_err(RpcError::io)?;
-        let mut answer = String::new();
-        io::stdin().read_line(&mut answer).map_err(RpcError::io)?;
-        Ok(())
+        platform::open_extension(
+            self.application.as_ref(),
+            &self.user_config,
+            self.isolated_profile,
+            artifact,
+        )?;
+        let stdin = io::stdin();
+        let stdout = io::stdout();
+        wait_for_install_confirmation(package, &mut stdin.lock(), &mut stdout.lock())
     }
 }
 
@@ -187,44 +171,6 @@ pub fn safe_terminal_text(value: &str) -> String {
     safe
 }
 
-fn resolve_aseprite_executable(path: Option<PathBuf>) -> RpcResult<Option<PathBuf>> {
-    let Some(mut path) = path else {
-        return Ok(None);
-    };
-    #[cfg(target_os = "macos")]
-    if path.extension().and_then(|extension| extension.to_str()) == Some("app") {
-        path = path.join("Contents/MacOS/aseprite");
-    }
-    let path = fs::canonicalize(&path).map_err(|error| {
-        if error.kind() == io::ErrorKind::NotFound {
-            RpcError::invalid(
-                "ASEPRITE_EXECUTABLE_NOT_FOUND",
-                format!("Aseprite executable does not exist: {}", path.display()),
-            )
-        } else {
-            RpcError::io(error)
-        }
-    })?;
-    let metadata = fs::metadata(&path).map_err(RpcError::io)?;
-    if !metadata.is_file() {
-        return Err(RpcError::invalid(
-            "INVALID_ASEPRITE_EXECUTABLE",
-            format!("Aseprite executable must be a file: {}", path.display()),
-        ));
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if metadata.permissions().mode() & 0o111 == 0 {
-            return Err(RpcError::invalid(
-                "INVALID_ASEPRITE_EXECUTABLE",
-                format!("Aseprite executable is not executable: {}", path.display()),
-            ));
-        }
-    }
-    Ok(Some(path))
-}
-
 fn require_interactive_install() -> RpcResult<()> {
     if io::stdin().is_terminal() {
         Ok(())
@@ -233,6 +179,49 @@ fn require_interactive_install() -> RpcResult<()> {
             "INTERACTIVE_INSTALL_REQUIRED",
             "installation requires a terminal and Aseprite confirmation; use --prepare-only in automation",
         ))
+    }
+}
+
+fn wait_for_install_confirmation(
+    package: &PreparedPackage,
+    input: &mut dyn BufRead,
+    output: &mut dyn Write,
+) -> RpcResult<()> {
+    let name = safe_terminal_text(display_name(package));
+    let version = safe_terminal_text(&package.version);
+    write!(
+        output,
+        "Confirm {} {} in Aseprite, then press Enter here to verify it. To stop, cancel the Aseprite prompt first, then type q here... ",
+        name, version
+    )
+    .map_err(RpcError::io)?;
+    output.flush().map_err(RpcError::io)?;
+
+    loop {
+        let mut answer = String::new();
+        if input.read_line(&mut answer).map_err(RpcError::io)? == 0 {
+            return Err(RpcError::invalid(
+                "INSTALL_VERIFICATION_CANCELLED",
+                "terminal input closed before verification; cancel the Aseprite prompt separately if it is still open",
+            ));
+        }
+        match answer.trim().to_ascii_lowercase().as_str() {
+            "" => return Ok(()),
+            "q" | "quit" | "cancel" => {
+                return Err(RpcError::invalid(
+                    "INSTALL_VERIFICATION_CANCELLED",
+                    "verification was cancelled; the Aseprite prompt must also be cancelled",
+                ));
+            }
+            _ => {
+                write!(
+                    output,
+                    "Press Enter to verify, or cancel in Aseprite and type q here... "
+                )
+                .map_err(RpcError::io)?;
+                output.flush().map_err(RpcError::io)?;
+            }
+        }
     }
 }
 
@@ -810,10 +799,19 @@ fn display_name(package: &PreparedPackage) -> &str {
 mod tests {
     use super::*;
     use std::fs::File;
+    use std::io::Cursor;
     use zip::ZipArchive;
 
     struct FakeAsepriteInstaller {
         user_config: PathBuf,
+    }
+
+    struct NoopAsepriteInstaller;
+
+    impl NativeInstaller for NoopAsepriteInstaller {
+        fn install(&self, _artifact: &Path, _package: &PreparedPackage) -> RpcResult<()> {
+            Ok(())
+        }
     }
 
     impl NativeInstaller for FakeAsepriteInstaller {
@@ -891,6 +889,65 @@ mod tests {
     }
 
     #[test]
+    fn install_confirmation_rejects_end_of_input() {
+        let package = PreparedPackage {
+            artifact_path: PathBuf::from("package.aseprite-extension"),
+            name: "example".to_owned(),
+            display_name: Some("Example".to_owned()),
+            version: "1.0.0".to_owned(),
+            sha256: "0".repeat(64),
+            byte_length: 1,
+            content_hash: None,
+        };
+        let mut input = Cursor::new(Vec::<u8>::new());
+        let mut output = Vec::new();
+
+        let error = wait_for_install_confirmation(&package, &mut input, &mut output).unwrap_err();
+
+        assert_eq!(error.code, "INSTALL_VERIFICATION_CANCELLED");
+    }
+
+    #[test]
+    fn install_confirmation_supports_an_explicit_cancel() {
+        let package = PreparedPackage {
+            artifact_path: PathBuf::from("package.aseprite-extension"),
+            name: "example".to_owned(),
+            display_name: Some("Example".to_owned()),
+            version: "1.0.0".to_owned(),
+            sha256: "0".repeat(64),
+            byte_length: 1,
+            content_hash: None,
+        };
+        let mut input = Cursor::new(b"q\n".to_vec());
+        let mut output = Vec::new();
+
+        let error = wait_for_install_confirmation(&package, &mut input, &mut output).unwrap_err();
+
+        assert_eq!(error.code, "INSTALL_VERIFICATION_CANCELLED");
+    }
+
+    #[test]
+    fn install_confirmation_only_accepts_a_blank_line() {
+        let package = PreparedPackage {
+            artifact_path: PathBuf::from("package.aseprite-extension"),
+            name: "example".to_owned(),
+            display_name: Some("Example".to_owned()),
+            version: "1.0.0".to_owned(),
+            sha256: "0".repeat(64),
+            byte_length: 1,
+            content_hash: None,
+        };
+        let mut input = Cursor::new(b"yes\n\n".to_vec());
+        let mut output = Vec::new();
+
+        wait_for_install_confirmation(&package, &mut input, &mut output).unwrap();
+
+        assert!(String::from_utf8(output)
+            .unwrap()
+            .contains("Press Enter to verify"));
+    }
+
+    #[test]
     fn manager_health_check_requires_identity_and_runtime_files() {
         let temporary = tempfile::tempdir().unwrap();
         let root = temporary.path();
@@ -947,5 +1004,42 @@ mod tests {
         assert_eq!(receipt.source_kind, "local");
         assert_eq!(receipt.installed_version, "1.0.0");
         assert!(state.cached_artifact("cli-local", false).unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn missing_install_cannot_create_a_receipt_for_an_empty_profile() {
+        let temporary = tempfile::tempdir().unwrap();
+        let user_config = temporary.path().join("profile");
+        fs::create_dir_all(&user_config).unwrap();
+        let source = temporary.path().join("source");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(
+            source.join("package.json"),
+            br#"{"name":"cli-noop","displayName":"CLI No-op","version":"1.0.0","main":"main.lua"}"#,
+        )
+        .unwrap();
+        fs::write(source.join("main.lua"), b"return true\n").unwrap();
+        let paths = ProfilePaths {
+            user_config: user_config.clone(),
+            manager_root: user_config.join("extensions").join(MANAGER_NAME),
+            aseprite_version: "1.3.15".to_owned(),
+            api_version: 35,
+        };
+
+        let error = install_with(
+            &paths,
+            source.to_str().unwrap(),
+            None,
+            false,
+            &NoopAsepriteInstaller,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.code, "INSTALL_VERIFICATION_FAILED");
+        let state = State::open_existing(&user_config).unwrap();
+        assert!(state.read_receipt("cli-noop").unwrap().is_none());
+        assert!(state.cached_artifact("cli-noop", false).unwrap().is_none());
+        assert!(state.cached_artifact("cli-noop", true).unwrap().is_none());
     }
 }

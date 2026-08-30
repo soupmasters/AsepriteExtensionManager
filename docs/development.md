@@ -72,7 +72,9 @@ profile must also pass `--aseprite PATH`. The CLI starts that executable with
 verification use the same location. `--aseprite` accepts the executable or a
 macOS `.app` bundle. The installed manager supplies the trusted catalog. The CLI
 and the in-app helper take an exclusive per-profile lock while changing manager
-state, so close the manager window before running `aem install`.
+state, so close the manager window before running `aem install`. On macOS, the
+executable form must be the `Contents/MacOS/aseprite` file inside an Aseprite
+`.app` bundle so the installer can be activated through LaunchServices.
 
 The checked-in `extension/` directory intentionally contains no helper
 binaries. Build helpers and stage a complete package before validation.

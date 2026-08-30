@@ -7,6 +7,7 @@ Protocol.METHODS = {
   scanInstalled = true,
   uninstallPackage = true,
   refreshRegistry = true,
+  listGitHubRepositories = true,
   resolveGitHub = true,
   preparePackage = true,
   prepareSelfUpdate = true,

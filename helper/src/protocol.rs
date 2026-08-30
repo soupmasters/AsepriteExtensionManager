@@ -146,6 +146,7 @@ pub enum Method {
     ScanInstalled,
     UninstallPackage,
     RefreshRegistry,
+    ListGitHubRepositories,
     ResolveGitHub,
     PreparePackage,
     PrepareSelfUpdate,
@@ -169,6 +170,7 @@ impl TryFrom<&str> for Method {
             "scanInstalled" => Ok(Self::ScanInstalled),
             "uninstallPackage" => Ok(Self::UninstallPackage),
             "refreshRegistry" => Ok(Self::RefreshRegistry),
+            "listGitHubRepositories" => Ok(Self::ListGitHubRepositories),
             "resolveGitHub" => Ok(Self::ResolveGitHub),
             "preparePackage" => Ok(Self::PreparePackage),
             "prepareSelfUpdate" => Ok(Self::PrepareSelfUpdate),
@@ -234,6 +236,10 @@ mod tests {
         assert_eq!(
             Method::try_from("uninstallPackage").unwrap(),
             Method::UninstallPackage
+        );
+        assert_eq!(
+            Method::try_from("listGitHubRepositories").unwrap(),
+            Method::ListGitHubRepositories
         );
         assert_eq!(
             Method::try_from("prepareSelfUpdate").unwrap(),

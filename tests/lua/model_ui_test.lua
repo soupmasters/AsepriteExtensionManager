@@ -183,6 +183,47 @@ Test.case("installed sorting and status filters compose before paging", function
   Test.falsy(model:set_sort("installed", "updates_first"))
 end)
 
+Test.case("GitHub repository pages stay separate from installed view state", function()
+  local model = Model.new(2)
+  model.installedSearch = "installed query"
+  model.installedPage = 3
+  model:set_search("github", "animation")
+  model:set_github_page({
+    {
+      nameWithOwner = "example/private-extension",
+      url = "https://github.com/example/private-extension",
+      isPrivate = true,
+    },
+    {
+      nameWithOwner = "example/public-extension",
+      url = "https://github.com/example/public-extension",
+      isPrivate = false,
+    },
+  }, 2, 5, true, "next==")
+
+  local repositories, page, pages, total = model:page("github")
+  Test.equal(#repositories, 2)
+  Test.equal(page, 2)
+  Test.equal(pages, 3)
+  Test.equal(total, 5)
+  Test.equal(model.githubSearch, "animation")
+  Test.equal(model.githubEndCursor, "next==")
+  Test.equal(model.installedSearch, "installed query")
+  Test.equal(model.installedPage, 3)
+  Test.falsy(model:move_page("github", 1))
+
+  local error_value = {
+    code = "GITHUB_CLI_AUTH_REQUIRED",
+    message = "Sign in first",
+  }
+  model:set_github_error(error_value)
+  Test.equal(model.githubError, error_value)
+  Test.equal(model.githubTotal, 0)
+  Test.truthy(model.githubLoaded)
+  Test.falsy(model.githubLoading)
+  Test.falsy(model:set_search("unknown", "value"))
+end)
+
 Test.case("manager is excluded from both package lists regardless of source", function()
   local manager_catalog = {
     id = "ASEPRITE-EXTENSION-MANAGER",
@@ -484,13 +525,50 @@ Test.case("manager uses compact native install and utility controls", function()
   Test.truthy(help_dialog.options.resizeable)
   Test.truthy(help_dialog.shown.autoscrollbars)
 
+  local dialog_count = #dialogs
   manager.widgetsById.preferences.definition.onclick()
-  local preferences_dialog = dialogs[3]
-  Test.equal(preferences_dialog.options.title, "Extension Manager Preferences")
-  Test.truthy(preferences_dialog.options.resizeable)
-  Test.truthy(preferences_dialog.shown.autoscrollbars)
-  Test.equal(preferences_dialog.widgetsById.save_preferences.definition.text, "Save")
-  Test.equal(preferences_dialog.widgetsById.cancel_preferences.definition.text, "Discard")
+  Test.equal(#dialogs, dialog_count)
+  Test.equal(ui.screen, "preferences")
+  Test.falsy(manager.widgetsById.manager_tabs.definition.visible)
+  Test.falsy(manager.widgetsById.manager_footer_separator.definition.visible)
+  Test.falsy(manager.widgetsById.manager_status.definition.visible)
+  Test.falsy(manager.widgetsById.install.definition.visible)
+  Test.falsy(manager.widgetsById.refresh.definition.visible)
+  Test.falsy(manager.widgetsById.preferences.definition.visible)
+  Test.falsy(manager.widgetsById.help.definition.visible)
+  Test.equal(manager.widgetsById.preferences_back.definition.text, "← Back")
+  Test.truthy(manager.widgetsById.preferences_back.definition.visible)
+  Test.truthy(manager.widgetsById.preferences_title.definition.visible)
+  Test.truthy(manager.widgetsById.startup_checks.definition.visible)
+  Test.truthy(manager.widgetsById.preferences_description.definition.visible)
+  Test.truthy(manager.widgetsById.preferences_local_data.definition.visible)
+  Test.truthy(manager.widgetsById.preferences_data_path.definition.visible)
+  Test.truthy(manager.widgetsById.preferences_clear_cache.definition.visible)
+  Test.contains(
+    manager.widgetsById.preferences_data_path.definition.text,
+    "extension-manager"
+  )
+  Test.falsy(manager.widgetsById.save_preferences)
+  Test.falsy(manager.widgetsById.cancel_preferences)
+  Test.truthy(same_row_after.preferences_header_lead)
+  Test.truthy(same_row_after.preferences_back)
+
+  manager.data.startup_checks = false
+  manager.widgetsById.startup_checks.definition.onclick()
+  Test.falsy(plugin.preferences.startupChecks)
+  manager.data.startup_checks = true
+  manager.widgetsById.startup_checks.definition.onclick()
+  Test.truthy(plugin.preferences.startupChecks)
+
+  manager.widgetsById.preferences_back.definition.onclick()
+  Test.equal(ui.screen, "manager")
+  Test.equal(ui.activeView, "browse")
+  Test.truthy(manager.widgetsById.manager_tabs.definition.visible)
+  Test.truthy(manager.widgetsById.manager_footer_separator.definition.visible)
+  Test.truthy(manager.widgetsById.manager_status.definition.visible)
+  Test.truthy(manager.widgetsById.install.definition.visible)
+  Test.falsy(manager.widgetsById.preferences_back.definition.visible)
+  Test.falsy(manager.widgetsById.preferences_title.definition.visible)
 
   for _, kind in ipairs({ "browse", "installed" }) do
     Test.equal(manager.widgetsById[kind .. "_search_label"].kind, "label")
@@ -498,28 +576,50 @@ Test.case("manager uses compact native install and utility controls", function()
     Test.falsy(manager.widgetsById[kind .. "_search"].definition.label)
     Test.truthy(same_row_after[kind .. "_search_label"])
     for index = 1, model.pageSize do
+      local lead_id = kind .. "_row_lead_" .. tostring(index)
       local row_id = kind .. "_row_" .. tostring(index)
       local details_id = kind .. "_details_" .. tostring(index)
+      local lead = manager.widgetsById[lead_id]
       local row = manager.widgetsById[row_id]
       local details = manager.widgetsById[details_id]
+      Test.equal(lead.kind, "label")
+      Test.equal(lead.definition.text, "")
+      Test.falsy(lead.definition.visible)
+      Test.falsy(lead.definition.hexpand)
       Test.equal(row.kind, "label")
       Test.falsy(row.definition.hexpand)
       Test.equal(details.kind, "button")
-      Test.equal(details.definition.text, "Details")
+      Test.equal(details.definition.text, "Details ▾")
       Test.falsy(details.definition.hexpand)
-      Test.truthy(same_row_after[row_id])
-      Test.equal(widget_indices[details_id], widget_indices[row_id] + 1)
-      Test.equal(manager.widgets[widget_indices[details_id] + 1].kind, "newrow")
+      Test.truthy(same_row_after[lead_id])
+      Test.truthy(same_row_after[details_id])
+      Test.equal(widget_indices[details_id], widget_indices[lead_id] + 1)
+      Test.equal(widget_indices[row_id], widget_indices[details_id] + 1)
+      Test.equal(manager.widgets[widget_indices[row_id] + 1].kind, "newrow")
       local stacked_details = manager.widgetsById[kind .. "_stacked_details_" .. tostring(index)]
       Test.equal(stacked_details.kind, "button")
-      Test.equal(stacked_details.definition.text, "Details")
+      Test.equal(stacked_details.definition.text, "Details ▾")
       Test.falsy(stacked_details.definition.visible)
       local stacked_index = widget_indices[kind .. "_stacked_details_" .. tostring(index)]
       Test.equal(manager.widgets[stacked_index - 1].kind, "newrow")
     end
   end
 
-  for _, kind in ipairs({ "browse", "installed" }) do
+  Test.truthy(manager.widgetsById.github_tab.definition.visible)
+  Test.truthy(manager.widgetsById.github_tab.definition.enabled)
+  Test.equal(manager.widgetsById.github_tab.definition.text, "GitHub")
+  for index = 1, model.pageSize do
+    Test.equal(
+      manager.widgetsById["github_details_" .. tostring(index)].definition.text,
+      "Install"
+    )
+    Test.equal(
+      manager.widgetsById["github_stacked_details_" .. tostring(index)].definition.text,
+      "Install"
+    )
+  end
+
+  for _, kind in ipairs({ "browse", "installed", "github" }) do
     manager:selectTab("manager_tabs", kind .. "_tab")
     local previous = manager.widgetsById[kind .. "_previous"].definition
     local page = manager.widgetsById[kind .. "_page"].definition
@@ -541,6 +641,9 @@ Test.case("manager uses compact native install and utility controls", function()
     if kind == "browse" then
       Test.equal(next_widget.kind, "tab")
       Test.equal(next_widget.definition.id, "installed_tab")
+    elseif kind == "installed" then
+      Test.equal(next_widget.kind, "tab")
+      Test.equal(next_widget.definition.id, "github_tab")
     else
       Test.equal(next_widget.kind, "endtabs")
       Test.equal(next_widget.definition.id, "manager_tabs")
@@ -616,6 +719,166 @@ Test.case("help reports missing tools and ignores diagnostics after close", func
     help_dialog.widgetsById.help_gh.definition.text,
     "✓ Installed · 2.50.0 · ✕ Sign-in unavailable"
   )
+end)
+
+Test.case("GitHub tab requires both tools and browses signed-in repositories", function()
+  local Dialog, dialogs = Fakes.dialog_factory()
+  local model = Model.new(2)
+  local ui = Ui.new({
+    app = Fakes.app {
+      allFilesExist = true,
+    },
+    plugin = Fakes.plugin(),
+    Dialog = Dialog,
+  }, model)
+  local diagnostics_callback
+  local searches = {}
+  local page_moves = {}
+  local installed_repository
+  local controller = {
+    refresh = function() end,
+    install_from_github = function() end,
+    sync_local_folder = function() end,
+    request_diagnostics = function(_, callback)
+      diagnostics_callback = callback
+      return {
+        cancel = function() end,
+      }
+    end,
+    search_github_repositories = function(_, query)
+      searches[#searches + 1] = query
+      model:set_github_page({
+        {
+          nameWithOwner = "example/private-extension",
+          url = "https://github.com/example/private-extension",
+          description = "Private extension",
+          isPrivate = true,
+          updatedAt = "2026-08-30T12:00:00Z",
+        },
+      }, 1, 3, true, "next==")
+      return true
+    end,
+    move_github_page = function(_, delta)
+      page_moves[#page_moves + 1] = delta
+      return true
+    end,
+    install_github_repository = function(_, repository)
+      installed_repository = repository
+    end,
+    on_dialog_closed = function() end,
+  }
+  ui:open(controller)
+
+  local manager = dialogs[1]
+  Test.falsy(manager.widgetsById.github_tab.definition.visible)
+  Test.falsy(manager.widgetsById.github_tab.definition.enabled)
+  diagnostics_callback({
+    tools = {
+      git = { installed = true },
+      gh = { installed = true, authenticated = true },
+    },
+  })
+  Test.truthy(manager.widgetsById.github_tab.definition.visible)
+  Test.truthy(manager.widgetsById.github_tab.definition.enabled)
+
+  manager:selectTab("manager_tabs", "github_tab")
+  Test.equal(ui.activeView, "github")
+  Test.equal(#searches, 1)
+  Test.equal(searches[1], "")
+  Test.truthy(manager.widgetsById.github_search.definition.visible)
+  Test.contains(
+    manager.widgetsById.github_row_1.definition.text,
+    "example/private-extension · Private"
+  )
+  Test.equal(manager.widgetsById.github_page.definition.text, "1 / 2")
+  Test.truthy(manager.widgetsById.github_next.definition.enabled)
+
+  manager:resize(500)
+  Test.falsy(manager.widgetsById.github_details_1.definition.visible)
+  Test.truthy(manager.widgetsById.github_stacked_details_1.definition.visible)
+
+  manager.data.github_search = "animation"
+  manager.widgetsById.github_search.definition.onchange()
+  Test.equal(searches[2], "animation")
+  manager.widgetsById.github_next.definition.onclick()
+  Test.equal(page_moves[1], 1)
+  manager.widgetsById.github_details_1.definition.onclick()
+  Test.equal(installed_repository.url, "https://github.com/example/private-extension")
+end)
+
+Test.case("GitHub tab stays hidden when either required tool is missing", function()
+  for _, missing in ipairs({ "git", "gh" }) do
+    local Dialog, dialogs = Fakes.dialog_factory()
+    local ui = Ui.new({
+      app = Fakes.app {
+        allFilesExist = true,
+      },
+      plugin = Fakes.plugin(),
+      Dialog = Dialog,
+    }, Model.new(1))
+    local diagnostics_callback
+    ui:open {
+      refresh = function() end,
+      install_from_github = function() end,
+      sync_local_folder = function() end,
+      request_diagnostics = function(_, callback)
+        diagnostics_callback = callback
+        return {
+          cancel = function() end,
+        }
+      end,
+      on_dialog_closed = function() end,
+    }
+    diagnostics_callback({
+      tools = {
+        git = { installed = missing ~= "git" },
+        gh = { installed = missing ~= "gh", authenticated = true },
+      },
+    })
+    Test.falsy(dialogs[1].widgetsById.github_tab.definition.visible)
+    Test.falsy(dialogs[1].widgetsById.github_tab.definition.enabled)
+  end
+end)
+
+Test.case("signed-out GitHub CLI shows the login instruction", function()
+  local Dialog, dialogs = Fakes.dialog_factory()
+  local ui = Ui.new({
+    app = Fakes.app {
+      allFilesExist = true,
+    },
+    plugin = Fakes.plugin(),
+    Dialog = Dialog,
+  }, Model.new(1))
+  local diagnostics_callback
+  local search_count = 0
+  ui:open {
+    refresh = function() end,
+    install_from_github = function() end,
+    sync_local_folder = function() end,
+    request_diagnostics = function(_, callback)
+      diagnostics_callback = callback
+      return {
+        cancel = function() end,
+      }
+    end,
+    search_github_repositories = function()
+      search_count = search_count + 1
+    end,
+    on_dialog_closed = function() end,
+  }
+  diagnostics_callback({
+    tools = {
+      git = { installed = true },
+      gh = { installed = true, authenticated = false },
+    },
+  })
+  local manager = dialogs[1]
+  Test.truthy(manager.widgetsById.github_tab.definition.visible)
+  manager:selectTab("manager_tabs", "github_tab")
+  Test.equal(search_count, 0)
+  Test.falsy(manager.widgetsById.github_search.definition.enabled)
+  Test.truthy(manager.widgetsById.github_empty.definition.visible)
+  Test.contains(manager.widgetsById.github_empty.definition.text, "gh auth login")
 end)
 
 Test.case("sort and filter controls update browse and installed independently", function()
@@ -911,7 +1174,9 @@ Test.case("manager package rows switch between wide and narrow layouts", functio
   Test.falsy(manager.widgetsById.installed_stacked_details_1.definition.enabled)
   ui:set_busy(false)
   manager.widgetsById.browse_stacked_details_1.definition.onclick()
-  Test.equal(dialogs[2].options.title, "browse-package")
+  Test.truthy(dialogs[2].shownMenu)
+  Test.equal(dialogs[2].options.parent, manager)
+  Test.contains(dialogs[2].widgetsById.package_summary.definition.text, "browse-package")
 
   manager:resize(1520)
   timers[#timers]:fire()
@@ -998,6 +1263,23 @@ Test.case("inactive manager tab controls stay hidden until selected", function()
   Test.truthy(manager.widgetsById.installed_filter.definition.visible)
   Test.falsy(manager.widgetsById.installed_stacked_filter.definition.visible)
   Test.truthy(manager.widgetsById.installed_page.definition.visible)
+
+  local dialog_count = #dialogs
+  manager.widgetsById.preferences.definition.onclick()
+  Test.equal(#dialogs, dialog_count)
+  Test.equal(ui.screen, "preferences")
+  Test.equal(ui.activeView, "installed")
+  assert_inactive_hidden("browse")
+  assert_inactive_hidden("installed")
+  Test.falsy(manager.widgetsById.manager_tabs.definition.visible)
+  Test.truthy(manager.widgetsById.preferences_back.definition.visible)
+  manager.widgetsById.preferences_back.definition.onclick()
+  Test.equal(ui.screen, "manager")
+  Test.equal(ui.activeView, "installed")
+  Test.equal(manager.data.manager_tabs, "installed_tab")
+  assert_inactive_hidden("browse")
+  assert_search_visible("installed")
+  Test.truthy(manager.widgetsById.installed_row_1.definition.visible)
 
   manager:resize(500)
   assert_inactive_hidden("browse")
@@ -1208,17 +1490,17 @@ Test.case("confirmation dialogs use readable wrapped rows and bounded width", fu
       Dialog = Dialog,
     }, Model.new(1))
     ui:confirm(
-      "Uninstall Extension",
+      "Clear Download Cache",
       table.concat({
-        "Uninstall Example Extension?",
+        "Clear cached downloads?",
         "",
-        "Its files will be moved out of Aseprite and kept as a recovery copy. "
-          .. "Restart Aseprite immediately afterward. Until then, the extension "
-          .. "may remain partly active or stop working.",
+        "Cached package files that are not needed by the current recovery point "
+          .. "will be removed. Installed extensions and linked source folders "
+          .. "will not be changed.",
         string.rep("x", 80),
       }, "\n"),
-      "Uninstall",
-      "Keep Extension"
+      "Clear Cache",
+      "Keep Cache"
     )
     return dialogs[1]
   end
@@ -1237,8 +1519,8 @@ Test.case("confirmation dialogs use readable wrapped rows and bounded width", fu
     Test.falsy(line:find("\n", 1, true))
     Test.truthy(#line <= 64)
   end
-  Test.equal(dialog.widgetsById.confirm_action.definition.text, "Uninstall")
-  Test.equal(dialog.widgetsById.cancel_action.definition.text, "Keep Extension")
+  Test.equal(dialog.widgetsById.confirm_action.definition.text, "Clear Cache")
+  Test.equal(dialog.widgetsById.cancel_action.definition.text, "Keep Cache")
   Test.truthy(dialog.shown.autoscrollbars)
   Test.truthy(dialog.shown.bounds)
   Test.truthy(dialog.shown.bounds.width >= 560)
@@ -1277,14 +1559,8 @@ Test.case("secondary windows are resizable and scroll when space is constrained"
   })
   ui:prompt_package_json()
   ui:show_help()
-  ui:show_preferences()
-  ui:show_package_details({
-    name = "example-package",
-    version = "1.0.0",
-    repository = "soupmasters/example-package",
-  }, "browse")
 
-  Test.equal(#dialogs, 10)
+  Test.equal(#dialogs, 8)
   Test.equal(dialogs[8].widgetsById.help_git.definition.text, "? Could not check")
   Test.equal(dialogs[8].widgetsById.help_gh.definition.text, "? Could not check")
   for _, dialog in ipairs(dialogs) do
@@ -1443,7 +1719,7 @@ Test.case("catalog author objects render by name", function()
   Test.falsy(row:find("table:", 1, true))
 end)
 
-Test.case("catalog identities are searchable and manifest names appear in details", function()
+Test.case("catalog identities are searchable and manifest names appear in menus", function()
   local app = Fakes.app {
     allFilesExist = true,
   }
@@ -1455,6 +1731,9 @@ Test.case("catalog identities are searchable and manifest names appear in detail
       manifestName = "Example-Tools",
       displayName = "Example Tools",
       version = "1.0.0",
+      latest = {
+        version = "1.0.0",
+      },
       repository = "https://github.com/example/UnityEventForAseprite",
     },
   }, "current", false, false)
@@ -1470,11 +1749,28 @@ Test.case("catalog identities are searchable and manifest names appear in detail
     plugin = Fakes.plugin(),
     Dialog = Dialog,
   }, model)
-  ui:show_package_details(matches[1], "browse")
-  Test.equal(dialogs[1].widgets[1].definition.text, "Example-Tools")
+  local install_requests = 0
+  ui.controller = {
+    install_registry_package = function(_, package)
+      Test.equal(package.id, "example-tools")
+      install_requests = install_requests + 1
+    end,
+  }
+  ui:show_package_menu(matches[1], "browse")
+  local menu = dialogs[1]
+  Test.truthy(menu.shownMenu)
+  Test.equal(menu.widgetsById.package_identity.definition.text, "Package: Example-Tools")
+  Test.contains(
+    menu.widgetsById.package_repository.definition.text,
+    "UnityEventForAseprite"
+  )
+  Test.falsy(menu.widgetsById.package_identity.definition.enabled)
+  Test.equal(menu.widgetsById.package_install.definition.text, "Install")
+  menu.widgetsById.package_install.definition.onclick()
+  Test.equal(install_requests, 1)
 end)
 
-Test.case("installed details route uninstall through the helper", function()
+Test.case("installed package menu routes uninstall through the helper", function()
   local app = Fakes.app {
     allFilesExist = true,
   }
@@ -1501,26 +1797,29 @@ Test.case("installed details route uninstall through the helper", function()
       return true
     end,
   }
-  ui:show_package_details({
+  model:set_installed({ {
     name = "example",
     displayName = "Example",
     version = "1.0.0",
     path = "/profile/extensions/example",
     managed = false,
-  }, "installed")
+  } })
+  ui:refresh()
+  dialogs[1]:selectTab("manager_tabs", "installed_tab")
+  dialogs[1].widgetsById.installed_details_1.definition.onclick()
 
-  local buttons = {}
-  for _, widget in ipairs(dialogs[2].widgets) do
-    if widget.kind == "button" then
-      buttons[widget.definition.text] = widget.definition
-    end
-  end
-  Test.truthy(buttons["Enable / Disable…"])
-  Test.truthy(buttons["Uninstall…"])
-  buttons["Uninstall…"].onclick()
+  local menu = dialogs[2]
+  Test.truthy(menu.shownMenu)
+  Test.falsy(menu.shown)
+  Test.equal(menu.options.parent, dialogs[1])
+  Test.equal(menu.widgetsById.package_enable_disable.kind, "menuItem")
+  Test.equal(menu.widgetsById.package_enable_disable.definition.text, "Enable / Disable…")
+  Test.equal(menu.widgetsById.package_uninstall.kind, "menuItem")
+  Test.equal(menu.widgetsById.package_uninstall.definition.text, "Uninstall")
+  Test.falsy(menu.widgetsById.package_summary.definition.enabled)
+  menu.widgetsById.package_uninstall.definition.onclick()
   Test.equal(uninstall_requests, 1)
   Test.equal(native_handoffs, 0)
-  Test.truthy(dialogs[2].closed)
 end)
 
 Test.case("help keeps hidden manager update and recovery actions available", function()
@@ -1598,7 +1897,7 @@ Test.case("help keeps hidden manager update and recovery actions available", fun
   Test.equal(restored, 1)
 end)
 
-Test.case("manager details never expose native disable or uninstall handoffs", function()
+Test.case("manager menu never exposes native disable or uninstall handoffs", function()
   local app = Fakes.app {
     allFilesExist = true,
   }
@@ -1624,7 +1923,7 @@ Test.case("manager details never expose native disable or uninstall handoffs", f
     end,
     open_native_extension_preferences = function() end,
   }
-  ui:show_package_details({
+  ui:show_package_menu({
     name = "aseprite-extension-manager",
     isSelf = true,
     displayName = "Aseprite Extension Manager",
@@ -1644,35 +1943,24 @@ Test.case("manager details never expose native disable or uninstall handoffs", f
     },
   }, "installed")
 
-  local details = dialogs[2]
-  local buttons = {}
-  local labels = {}
-  for _, widget in ipairs(details.widgets) do
-    if widget.kind == "button" then
-      buttons[widget.definition.text] = widget.definition
-    elseif widget.kind == "label" then
-      labels[#labels + 1] = widget.definition
-    end
-  end
-  Test.truthy(buttons["Update Manager…"])
-  Test.truthy(buttons["Restore Manager…"])
-  Test.falsy(buttons["Enable / Disable…"])
-  Test.falsy(buttons["Uninstall…"])
-  local saw_update_error = false
-  local saw_recovery = false
-  for _, label in ipairs(labels) do
-    if label.label == "Update check:" then
-      saw_update_error = label.text == "Could not check the official release."
-    elseif label.label == "Recovery package:" then
-      saw_recovery = label.text == "/state/self-update/recovery.aseprite-extension"
-    end
-  end
-  Test.truthy(saw_update_error)
-  Test.truthy(saw_recovery)
+  local menu = dialogs[2]
+  Test.truthy(menu.shownMenu)
+  Test.equal(menu.widgetsById.package_update_action.definition.text, "Update Manager…")
+  Test.equal(menu.widgetsById.package_restore.definition.text, "Restore Manager…")
+  Test.falsy(menu.widgetsById.package_enable_disable)
+  Test.falsy(menu.widgetsById.package_uninstall)
+  Test.contains(
+    menu.widgetsById.package_update_error.definition.text,
+    "Could not check the official release."
+  )
+  Test.contains(
+    menu.widgetsById.package_recovery.definition.text,
+    "/state/self-update/recovery.aseprite-extension"
+  )
 
-  buttons["Update Manager…"].onclick()
+  menu.widgetsById.package_update_action.definition.onclick()
   Test.equal(updated, 1)
-  buttons["Restore Manager…"].onclick()
+  menu.widgetsById.package_restore.definition.onclick()
   Test.equal(restored, 1)
 end)
 

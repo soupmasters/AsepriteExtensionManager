@@ -95,6 +95,9 @@ function Controller.new(environment)
     activeOperation = nil,
     restartRequired = false,
     refreshGeneration = 0,
+    githubGeneration = 0,
+    githubTicket = nil,
+    githubCursors = {},
     closed = false,
   }, Controller)
 
@@ -233,6 +236,92 @@ function Controller:request_diagnostics(callback)
       end
     end,
   })
+end
+
+function Controller:_cancel_github_request()
+  self.githubGeneration = self.githubGeneration + 1
+  if self.githubTicket then
+    self.githubTicket.cancel()
+    self.githubTicket = nil
+  end
+  self.model.githubLoading = false
+end
+
+function Controller:load_github_repositories(query, cursor, page)
+  if self.closed then
+    return false
+  end
+  query = tostring(query or ""):match("^%s*(.-)%s*$")
+  page = math.max(1, tonumber(page) or 1)
+  self:_cancel_github_request()
+  local generation = self.githubGeneration
+  self.model.githubLoading = true
+  self.model.githubError = nil
+  self.ui:refresh()
+
+  local params = {}
+  if query ~= "" then
+    params.query = query
+  end
+  if type(cursor) == "string" and cursor ~= "" then
+    params.cursor = cursor
+  end
+  local ticket
+  ticket = self:_ensure_rpc():request("listGitHubRepositories", params, {
+    onSuccess = function(result)
+      if self.closed or generation ~= self.githubGeneration then
+        return
+      end
+      self.githubTicket = nil
+      local repositories = list_from(result, "repositories")
+      self.model:set_github_page(
+        repositories,
+        page,
+        result.totalCount,
+        result.hasNextPage,
+        result.endCursor
+      )
+      if result.hasNextPage == true and type(result.endCursor) == "string" then
+        self.githubCursors[page + 1] = result.endCursor
+      else
+        self.githubCursors[page + 1] = nil
+      end
+      self.ui:refresh()
+    end,
+    onError = function(error_value)
+      if self.closed or generation ~= self.githubGeneration then
+        return
+      end
+      self.githubTicket = nil
+      self.model:set_github_error(error_value)
+      self.ui:refresh()
+    end,
+  })
+  self.githubTicket = ticket
+  return ticket ~= nil
+end
+
+function Controller:search_github_repositories(query)
+  query = tostring(query or ""):match("^%s*(.-)%s*$")
+  self.githubCursors = {}
+  self.model:set_search("github", query)
+  return self:load_github_repositories(query, nil, 1)
+end
+
+function Controller:move_github_page(delta)
+  delta = tonumber(delta) or 0
+  local target = math.max(
+    1,
+    math.min(self.model.githubPage + delta, self.model.githubPageCount)
+  )
+  if target == self.model.githubPage then
+    return false
+  end
+  local cursor = target == 1 and nil or self.githubCursors[target]
+  if target > 1 and type(cursor) ~= "string" then
+    return false
+  end
+  return self:load_github_repositories(self.model.githubSearch, cursor, target)
 end
 
 function Controller:_shutdown_rpc(on_done)
@@ -990,17 +1079,7 @@ function Controller:_resolve_github(operation, url, selection)
   self:_set_ticket(operation, ticket)
 end
 
-function Controller:install_from_github()
-  if self:_restart_blocks_management() then
-    return false
-  end
-  if self.activeOperation then
-    return false
-  end
-  local url = self.ui:prompt_github_url()
-  if not url then
-    return false
-  end
+function Controller:_start_github_install(url)
   url = tostring(url):match("^%s*(.-)%s*$")
   if url == "" then
     self.ui:show_error("GitHub URL Required", {
@@ -1016,6 +1095,38 @@ function Controller:install_from_github()
   end
   self:_resolve_github(operation, url)
   return true
+end
+
+function Controller:install_from_github()
+  if self:_restart_blocks_management() then
+    return false
+  end
+  if self.activeOperation then
+    return false
+  end
+  local url = self.ui:prompt_github_url()
+  if not url then
+    return false
+  end
+  return self:_start_github_install(url)
+end
+
+function Controller:install_github_repository(repository)
+  if self:_restart_blocks_management() then
+    return false
+  end
+  if self.activeOperation then
+    return false
+  end
+  local url = type(repository) == "table" and repository.url or nil
+  if type(url) ~= "string" or url == "" then
+    self.ui:show_error("GitHub Repository Unavailable", {
+      code = "missing_url",
+      message = "The selected GitHub repository does not have a valid URL.",
+    })
+    return false
+  end
+  return self:_start_github_install(url)
 end
 
 function Controller:sync_local_folder()
@@ -1276,22 +1387,6 @@ function Controller:uninstall_package(package)
   end
 
   local display_name = tostring(package.displayName or name)
-  local message_lines = {
-    "Uninstall " .. display_name .. "?",
-    "",
-    "Its files will be moved out of Aseprite and kept as a recovery copy.",
-    "Restart Aseprite immediately afterward.",
-    "Until then, the extension may remain partly active or stop working.",
-  }
-  if type(package.source) == "table" and package.source.kind == "local" then
-    message_lines[#message_lines + 1] = ""
-    message_lines[#message_lines + 1] = "Your linked source folder will not be changed."
-  end
-  local message = table.concat(message_lines, "\n")
-  if not self.ui:confirm("Uninstall Extension", message, "Uninstall") then
-    return false
-  end
-
   local operation = self:_begin_operation(
     "Uninstall Extension",
     "Uninstalling " .. display_name .. "…",
@@ -1373,34 +1468,13 @@ function Controller:uninstall_package(package)
   return true
 end
 
-function Controller:open_native_extension_preferences(action, package)
+function Controller:open_native_extension_preferences(_, package)
   if self:_restart_blocks_management() then
     return false
   end
   if is_manager_package(package) then
     return false
   end
-  local package_name = package and (package.displayName or package.name)
-    or "the extension"
-  local instruction
-  if action == "enable_disable" then
-    instruction = "Choose Extensions in Aseprite Preferences, select "
-      .. tostring(package_name)
-      .. ", then enable or disable it."
-  elseif action == "uninstall" then
-    instruction = "Choose Extensions in Aseprite Preferences, select "
-      .. tostring(package_name)
-      .. ", then use Uninstall."
-  else
-    instruction =
-      "Choose Extensions in Aseprite Preferences to enable, disable, or uninstall."
-  end
-  self.app.alert {
-    title = "Manage Aseprite Extension",
-    text = instruction,
-    buttons = "Continue",
-  }
-
   local opened, command_result = pcall(function()
     return self.app.command.Options()
   end)
@@ -1418,6 +1492,7 @@ end
 
 function Controller:on_dialog_closed()
   self:_stop_self_update_timer()
+  self:_cancel_github_request()
   self.refreshGeneration = self.refreshGeneration + 1
   if self.activeOperation then
     if self.activeOperation.kind == "uninstall" then
@@ -1439,6 +1514,7 @@ function Controller:close()
   self:_stop_self_update_timer()
   self:_stop_startup_offer_timer()
   self.pendingStartupManagerUpdateVersion = nil
+  self:_cancel_github_request()
   if self.startupTimer then
     pcall(function()
       self.startupTimer:stop()

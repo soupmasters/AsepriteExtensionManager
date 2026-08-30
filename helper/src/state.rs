@@ -4,6 +4,7 @@ use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -18,6 +19,11 @@ const LOG_FILE_LIMIT: u64 = 512 * 1024;
 #[derive(Clone, Debug)]
 pub struct State {
     root: PathBuf,
+}
+
+#[derive(Debug)]
+pub struct StateLock {
+    file: fs::File,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -105,11 +111,63 @@ impl State {
         Ok(state)
     }
 
+    pub fn new_locked(user_config_path: impl AsRef<Path>) -> RpcResult<(Self, StateLock)> {
+        let root = user_config_path.as_ref().join("extension-manager");
+        let state = Self { root };
+        state.ensure_directories()?;
+        let lock = state.try_lock()?;
+        state.reconcile_uninstalls()?;
+        Ok((state, lock))
+    }
+
+    pub fn open_existing(user_config_path: impl AsRef<Path>) -> RpcResult<Self> {
+        let root = user_config_path.as_ref().join("extension-manager");
+        match fs::symlink_metadata(&root) {
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+                return Err(RpcError::state(format!(
+                    "manager state path must be a real directory: {}",
+                    root.display()
+                )));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(RpcError::io(error)),
+        }
+        Ok(Self { root })
+    }
+
     pub fn root(&self) -> &Path {
         &self.root
     }
 
+    pub fn try_lock(&self) -> RpcResult<StateLock> {
+        let path = self.root.join("manager.lock");
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .map_err(RpcError::io)?;
+        file.try_lock_exclusive().map_err(|error| {
+            if error.kind() == fs2::lock_contended_error().kind() {
+                RpcError::invalid(
+                    "PROFILE_BUSY",
+                    "another Aseprite Extension Manager process is using this profile",
+                )
+            } else {
+                RpcError::io(error)
+            }
+        })?;
+        Ok(StateLock { file })
+    }
+
     pub fn ensure(&self) -> RpcResult<()> {
+        self.ensure_directories()?;
+        self.reconcile_uninstalls()
+    }
+
+    fn ensure_directories(&self) -> RpcResult<()> {
         ensure_real_state_directory(&self.root)?;
         for name in [
             "cache",
@@ -123,7 +181,7 @@ impl State {
         ] {
             ensure_real_state_directory(&self.root.join(name))?;
         }
-        self.reconcile_uninstalls()
+        Ok(())
     }
 
     pub fn begin_self_update(
@@ -441,7 +499,17 @@ impl State {
 
     pub fn receipts(&self) -> RpcResult<Vec<Receipt>> {
         let directory = self.root.join("receipts");
-        ensure_real_state_directory(&directory)?;
+        match fs::symlink_metadata(&directory) {
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+                return Err(RpcError::state(format!(
+                    "manager receipts path must be a real directory: {}",
+                    directory.display()
+                )));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(RpcError::io(error)),
+        }
         let mut receipts: Vec<Receipt> = Vec::new();
         for entry in fs::read_dir(directory).map_err(RpcError::io)? {
             let entry = entry.map_err(RpcError::io)?;
@@ -463,7 +531,6 @@ impl State {
 
     fn receipt_path(&self, package_name: &str) -> RpcResult<PathBuf> {
         let receipts = self.root.join("receipts");
-        ensure_real_state_directory(&receipts)?;
         Ok(receipts.join(format!("{}.json", safe_package_id(package_name)?)))
     }
 
@@ -651,6 +718,12 @@ impl State {
             .append(true)
             .open(current)
             .map_err(RpcError::io)
+    }
+}
+
+impl Drop for StateLock {
+    fn drop(&mut self) {
+        let _ = FileExt::unlock(&self.file);
     }
 }
 
@@ -1128,6 +1201,29 @@ mod tests {
                 "non-device package name should remain valid: {name}"
             );
         }
+    }
+
+    #[test]
+    fn profile_lock_is_exclusive_and_reusable() {
+        let temporary = tempfile::tempdir().expect("tempdir");
+        let state = State::new(temporary.path()).expect("state");
+        let first = state.try_lock().expect("first lock");
+        assert_eq!(
+            state.try_lock().expect_err("second lock must fail").code,
+            "PROFILE_BUSY"
+        );
+        drop(first);
+        state.try_lock().expect("lock after release");
+    }
+
+    #[test]
+    fn opening_existing_state_does_not_create_it() {
+        let temporary = tempfile::tempdir().expect("tempdir");
+        let state = State::open_existing(temporary.path()).expect("state handle");
+
+        assert!(!state.root().exists());
+        assert!(state.receipts().expect("receipts").is_empty());
+        assert!(!state.root().exists());
     }
 
     #[test]

@@ -49,6 +49,12 @@ jobs:
             echo "Helper version $helper_version does not match extension version $package_version."
             exit 1
           fi
+          cli_version="$(cargo metadata --locked --no-deps --format-version 1 \
+            | jq --raw-output '.packages[] | select(.name == "aem-cli") | .version')"
+          if [[ "$cli_version" != "$package_version" ]]; then
+            echo "CLI version $cli_version does not match extension version $package_version."
+            exit 1
+          fi
           echo "package_version=$package_version" >> "$GITHUB_OUTPUT"
 
   macos-helper:
@@ -65,6 +71,8 @@ jobs:
         run: |
           cargo build --locked --release -p aem-helper --target aarch64-apple-darwin
           cargo build --locked --release -p aem-helper --target x86_64-apple-darwin
+          cargo build --locked --release -p aem-cli --bin aem --target aarch64-apple-darwin
+          cargo build --locked --release -p aem-cli --bin aem --target x86_64-apple-darwin
       - name: Assemble and smoke-test universal helper
         env:
           PACKAGE_VERSION: ${{ needs.package-metadata.outputs.package_version }}
@@ -78,10 +86,24 @@ jobs:
           lipo artifacts/macos/aem-helper -verify_arch arm64 x86_64
           test "$(artifacts/macos/aem-helper --version)" = "aem-helper $PACKAGE_VERSION"
           artifacts/macos/aem-helper smoke
+          lipo -create \
+            target/aarch64-apple-darwin/release/aem \
+            target/x86_64-apple-darwin/release/aem \
+            -output artifacts/macos/aem
+          chmod 0755 artifacts/macos/aem
+          lipo artifacts/macos/aem -verify_arch arm64 x86_64
+          test "$(artifacts/macos/aem --version)" = "aem $PACKAGE_VERSION"
+          tar -czf "artifacts/aem-$PACKAGE_VERSION-universal-apple-darwin.tar.gz" \
+            -C artifacts/macos aem
       - uses: actions/upload-artifact@v7
         with:
           name: helper-macos
           path: artifacts/macos/aem-helper
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v7
+        with:
+          name: aem-${{ needs.package-metadata.outputs.package_version }}-macos
+          path: artifacts/aem-${{ needs.package-metadata.outputs.package_version }}-universal-apple-darwin.tar.gz
           if-no-files-found: error
 
   windows-helper:
@@ -92,8 +114,10 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Build helper
-        run: cargo build --locked --release -p aem-helper
+      - name: Build helper and CLI
+        run: |
+          cargo build --locked --release -p aem-helper
+          cargo build --locked --release -p aem-cli --bin aem
       - name: Smoke-test helper
         shell: pwsh
         env:
@@ -106,10 +130,21 @@ jobs:
             throw "Helper reported $reportedVersion; expected aem-helper $env:PACKAGE_VERSION"
           }
           & artifacts/windows/aem-helper.exe smoke
+          Copy-Item target/release/aem.exe artifacts/windows/aem.exe
+          $cliVersion = (& artifacts/windows/aem.exe --version).Trim()
+          if ($cliVersion -ne "aem $env:PACKAGE_VERSION") {
+            throw "CLI reported $cliVersion; expected aem $env:PACKAGE_VERSION"
+          }
+          Compress-Archive -Path artifacts/windows/aem.exe -DestinationPath "artifacts/aem-$env:PACKAGE_VERSION-x86_64-pc-windows-msvc.zip"
       - uses: actions/upload-artifact@v7
         with:
           name: helper-windows
           path: artifacts/windows/aem-helper.exe
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v7
+        with:
+          name: aem-${{ needs.package-metadata.outputs.package_version }}-windows
+          path: artifacts/aem-${{ needs.package-metadata.outputs.package_version }}-x86_64-pc-windows-msvc.zip
           if-no-files-found: error
 
   linux-helper:
@@ -126,10 +161,12 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install --yes musl-tools
-      - name: Build helper
-        run: >-
-          cargo build --locked --release -p aem-helper
-          --target x86_64-unknown-linux-musl
+      - name: Build helper and CLI
+        run: |
+          cargo build --locked --release -p aem-helper \
+            --target x86_64-unknown-linux-musl
+          cargo build --locked --release -p aem-cli --bin aem \
+            --target x86_64-unknown-linux-musl
       - name: Verify portability and smoke-test
         env:
           PACKAGE_VERSION: ${{ needs.package-metadata.outputs.package_version }}
@@ -140,10 +177,21 @@ jobs:
           file artifacts/linux/aem-helper | grep -E 'static|statically linked'
           test "$(artifacts/linux/aem-helper --version)" = "aem-helper $PACKAGE_VERSION"
           artifacts/linux/aem-helper smoke
+          cp target/x86_64-unknown-linux-musl/release/aem artifacts/linux/aem
+          chmod 0755 artifacts/linux/aem
+          file artifacts/linux/aem | grep -E 'static|statically linked'
+          test "$(artifacts/linux/aem --version)" = "aem $PACKAGE_VERSION"
+          tar -czf "artifacts/aem-$PACKAGE_VERSION-x86_64-unknown-linux-musl.tar.gz" \
+            -C artifacts/linux aem
       - uses: actions/upload-artifact@v7
         with:
           name: helper-linux
           path: artifacts/linux/aem-helper
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v7
+        with:
+          name: aem-${{ needs.package-metadata.outputs.package_version }}-linux
+          path: artifacts/aem-${{ needs.package-metadata.outputs.package_version }}-x86_64-unknown-linux-musl.tar.gz
           if-no-files-found: error
 
   assemble:

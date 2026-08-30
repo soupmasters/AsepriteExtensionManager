@@ -149,6 +149,96 @@ pub fn validate_extension(path: &Path, expected: ExpectedManifest<'_>) -> RpcRes
     Ok(inspection.manifest)
 }
 
+pub fn verify_installed_artifact(
+    artifact_path: &Path,
+    installed_root: &Path,
+    expected_name: &str,
+    expected_version: &str,
+) -> RpcResult<()> {
+    validate_extension(
+        artifact_path,
+        ExpectedManifest {
+            name: Some(expected_name),
+            version: Some(expected_version),
+        },
+    )?;
+    let root_metadata = fs::symlink_metadata(installed_root).map_err(RpcError::io)?;
+    if root_metadata.file_type().is_symlink() || !root_metadata.is_dir() {
+        return Err(RpcError::invalid(
+            "INSTALL_CONTENT_MISMATCH",
+            "the installed extension is not a real directory",
+        ));
+    }
+
+    let input = fs::File::open(artifact_path).map_err(RpcError::io)?;
+    let mut archive = ZipArchive::new(input).map_err(zip_error)?;
+    let mut total = 0_u64;
+    for index in 0..archive.len() {
+        let mut file = archive.by_index(index).map_err(zip_error)?;
+        validate_zip_entry_type(&file)?;
+        let normalized = normalize_archive_path(file.name())?;
+        if file.is_dir()
+            || normalized
+                .rsplit('/')
+                .next()
+                .is_some_and(|name| name.eq_ignore_ascii_case("__info.json"))
+        {
+            continue;
+        }
+        enforce_entry_size(&file, &mut total)?;
+        let destination = installed_root.join(&normalized);
+        let metadata = fs::symlink_metadata(&destination).map_err(|_| {
+            RpcError::invalid(
+                "INSTALL_CONTENT_MISMATCH",
+                format!("the installed extension is missing {normalized}"),
+            )
+        })?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(RpcError::invalid(
+                "INSTALL_CONTENT_MISMATCH",
+                format!("the installed extension contains an unsafe {normalized}"),
+            ));
+        }
+        ensure_real_parent_chain(installed_root, &destination)?;
+        let mut expected = Vec::with_capacity(file.size().min(MAX_FILE_BYTES) as usize);
+        file.read_to_end(&mut expected)
+            .map_err(map_zip_read_error)?;
+        let actual = fs::read(&destination).map_err(RpcError::io)?;
+        if actual != expected {
+            return Err(RpcError::invalid(
+                "INSTALL_CONTENT_MISMATCH",
+                format!("the installed file differs from the prepared package: {normalized}"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn ensure_real_parent_chain(root: &Path, path: &Path) -> RpcResult<()> {
+    let relative = path.strip_prefix(root).map_err(|_| {
+        RpcError::invalid(
+            "INSTALL_CONTENT_MISMATCH",
+            "the installed extension path escaped its package directory",
+        )
+    })?;
+    let mut current = root.to_path_buf();
+    let parent_count = relative.components().count().saturating_sub(1);
+    for component in relative.components().take(parent_count) {
+        current.push(component.as_os_str());
+        let metadata = fs::symlink_metadata(&current).map_err(RpcError::io)?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(RpcError::invalid(
+                "INSTALL_CONTENT_MISMATCH",
+                format!(
+                    "the installed extension contains an unsafe path: {}",
+                    current.display()
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
 pub fn validate_extension_directory(root: &Path) -> RpcResult<Manifest> {
     let files = collect_extension_directory_files(root)?;
     let names: BTreeSet<_> = files.iter().map(|(path, _)| path.clone()).collect();

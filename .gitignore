@@ -2,16 +2,36 @@
 /target/
 /dist/
 /.build/
+/artifacts/
 *.aseprite-extension
+
+# Local Aseprite profiles and manager state
+/extension-manager/
+/extensions/
+/aseprite.ini
+/crashdb/
+/files/
+/palettes/
+/scripts/
+/sessions/
+/user.aseprite-brushes
+/user.aseprite-keys
+/user.aseprite-layouts
 
 # Editors
 .idea/
 .vscode/
 .fleet/
+.vs/
+.zed/
 *.iml
+*.bak
+*.orig
+*.rej
 *.swp
 *.swo
 *~
+.#*
 
 # Operating-system metadata
 .DS_Store
@@ -20,7 +40,26 @@
 ._*
 Thumbs.db
 Desktop.ini
+.directory
+ehthumbs.db
+ehthumbs_vista.db
+$RECYCLE.BIN/
+*.stackdump
 
-# Local logs and temporary files
+# Local secrets, caches, reports, logs, and temporary files
+.env
+.env.*
+!.env.example
+.direnv/
+.cache/
+/.cargo/credentials
+/.cargo/credentials.toml
+/coverage/
+lcov.info
+*.profraw
+*.profdata
+*.luac
 *.log
 *.tmp
+*.dmp
+*.crash

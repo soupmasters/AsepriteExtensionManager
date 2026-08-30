@@ -36,6 +36,12 @@ timeout. The downloaded bytes still pass through the same size limits,
 normalization, manifest validation, hashing, and staging used for public
 downloads.
 
+The GitHub tab is shown only when both Git and GitHub CLI are installed.
+Repository discovery uses a fixed, cursor-paged GraphQL query with bounded
+output. Search text and cursors are passed as individual process arguments,
+not through a shell. Private repository metadata is displayed only in the
+local manager window and is never cached or logged.
+
 Release resolution prefers one stable `.aseprite-extension` asset. Multiple
 matching assets require explicit selection. Repository branches and tags are
 resolved to a full commit SHA before download. Managed GitHub receipts also

@@ -16,8 +16,8 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{accept_hdr_async, WebSocketStream};
 
 use crate::github::{
-    parse_github_url, GitHubClient, GitHubSource, GitHubTarget, ManagerRelease, ResolveOptions,
-    ResolveResult,
+    parse_github_url, GitHubClient, GitHubSource, GitHubTarget, ListRepositoriesOptions,
+    ManagerRelease, ResolveOptions, ResolveResult,
 };
 use crate::installed;
 use crate::package::{self, ExpectedManifest, PreparedPackage};
@@ -68,7 +68,7 @@ struct Context {
 }
 
 pub async fn serve(options: ServeOptions) -> RpcResult<()> {
-    let state = State::new(&options.user_config)?;
+    let (state, _state_lock) = State::new_locked(&options.user_config)?;
     let self_update_status = reconcile_pending_self_update(&options.extension_root, &state);
     let listener = TcpListener::bind(("127.0.0.1", 0))
         .await
@@ -331,6 +331,11 @@ async fn handle_request(context: Arc<Context>, method: Method, params: Value) ->
             let view = context.registry.refresh(Utc::now())?;
             *context.registry_view.write().await = Some(view.clone());
             serde_json::to_value(view).map_err(|error| RpcError::internal(error.to_string()))
+        }
+        Method::ListGitHubRepositories => {
+            let options: ListRepositoriesOptions = decode_params(params)?;
+            let page = context.github.list_repositories(options).await?;
+            serde_json::to_value(page).map_err(|error| RpcError::internal(error.to_string()))
         }
         Method::ResolveGitHub => {
             let options: ResolveOptions = decode_params(params)?;
@@ -1236,83 +1241,12 @@ fn verify_install(context: &Context, params: VerifyInstallParams) -> RpcResult<V
             version: Some(&params.version),
         },
     )?;
-    match installed::verify(
+    crate::installation::verify_and_record(
         &context.user_config,
         &context.state,
-        &params.name,
-        &params.version,
-    ) {
-        Ok(_) => {}
-        Err(error) if error.code == "INSTALL_VERIFICATION_FAILED" => {
-            let previous_receipt = context.state.read_receipt(&params.name)?;
-            let currently_installed =
-                installed::find(&context.user_config, &context.state, &params.name)?;
-            let current_intact = previous_receipt
-                .as_ref()
-                .zip(currently_installed.as_ref())
-                .is_some_and(|(receipt, installed)| receipt.installed_version == installed.version);
-            return Ok(serde_json::json!({
-                "verified": false,
-                "message": error.message,
-                "currentIntact": current_intact,
-                "rollbackAvailable": !current_intact
-                    && context.state.cached_artifact(&params.name, false)?.is_some()
-            }));
-        }
-        Err(error) => return Err(error),
-    }
-    let prior_receipt = context.state.read_receipt(&params.name)?;
-    let (current, previous) = context
-        .state
-        .cache_artifact(&params.name, &prepared.artifact_path)?;
-    let (
-        previous_source,
-        previous_version,
-        previous_artifact_sha256,
-        previous_artifact_byte_length,
-    ) = previous_identity(prior_receipt.as_ref(), &prepared.sha256, previous.is_some());
-    let source_kind = params
-        .source
-        .get("kind")
-        .and_then(Value::as_str)
-        .unwrap_or("unknown")
-        .to_owned();
-    let receipt = Receipt {
-        schema_version: 1,
-        package_name: params.name.clone(),
-        source_kind,
-        commit: string_field(&params.source, "commit"),
-        release: string_field(&params.source, "release"),
-        asset: string_field(&params.source, "assetName"),
-        installed_version: params.version,
-        artifact_sha256: prepared.sha256,
-        artifact_byte_length: prepared.byte_length,
-        installed_at: Utc::now(),
-        local_folder: params
-            .source
-            .get("packageJsonPath")
-            .and_then(Value::as_str)
-            .map(PathBuf::from)
-            .and_then(|path| path.parent().map(Path::to_owned)),
-        content_hash: params
-            .source
-            .get("contentHash")
-            .and_then(Value::as_str)
-            .map(ToOwned::to_owned),
-        previous_artifact: previous,
-        previous_source,
-        previous_version,
-        previous_artifact_sha256,
-        previous_artifact_byte_length,
-        source: params.source,
-    };
-    let receipt_path = context.state.write_receipt(&receipt)?;
-    Ok(serde_json::json!({
-        "verified": true,
-        "receipt": receipt,
-        "receiptPath": receipt_path,
-        "cachedArtifact": current
-    }))
+        prepared,
+        params.source,
+    )
 }
 
 fn trusted_artifact_path(state: &State, path: &Path) -> RpcResult<PathBuf> {
@@ -1348,34 +1282,6 @@ fn string_field(value: &Value, name: &str) -> Option<String> {
         .get(name)
         .and_then(Value::as_str)
         .map(ToOwned::to_owned)
-}
-
-fn previous_identity(
-    prior: Option<&Receipt>,
-    prepared_sha256: &str,
-    has_previous_artifact: bool,
-) -> (Option<Value>, Option<String>, Option<String>, Option<u64>) {
-    if !has_previous_artifact {
-        return (None, None, None, None);
-    }
-    let Some(prior) = prior else {
-        return (None, None, None, None);
-    };
-    if prior.artifact_sha256.eq_ignore_ascii_case(prepared_sha256) {
-        (
-            prior.previous_source.clone(),
-            prior.previous_version.clone(),
-            prior.previous_artifact_sha256.clone(),
-            prior.previous_artifact_byte_length,
-        )
-    } else {
-        (
-            Some(prior.source.clone()),
-            Some(prior.installed_version.clone()),
-            Some(prior.artifact_sha256.clone()),
-            Some(prior.artifact_byte_length),
-        )
-    }
 }
 
 fn verify_rollback_artifact_integrity(
@@ -1826,7 +1732,8 @@ mod tests {
             previous_artifact_sha256: Some("9".repeat(64)),
             previous_artifact_byte_length: Some(1),
         };
-        let identity = previous_identity(Some(&receipt), &"a".repeat(64), true);
+        let identity =
+            crate::installation::previous_identity(Some(&receipt), &"a".repeat(64), true);
         assert_eq!(identity.0, Some(previous_source));
         assert_eq!(identity.1.as_deref(), Some("0.9.0"));
         assert_eq!(identity.2, Some("9".repeat(64)));

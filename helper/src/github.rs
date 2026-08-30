@@ -1,3 +1,4 @@
+use std::ffi::OsString;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -26,6 +27,10 @@ const API_ROOT: &str = "https://api.github.com";
 const GH_JSON_BYTES: u64 = 4 * 1024 * 1024;
 const GH_JSON_TIMEOUT: Duration = Duration::from_secs(30);
 const GH_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(120);
+const GH_REPOSITORY_JSON_BYTES: u64 = 512 * 1024;
+const GH_REPOSITORY_PAGE_SIZE: u32 = 6;
+const GH_REPOSITORY_QUERY: &str = r#"query($first:Int!,$after:String){viewer{repositories(first:$first,after:$after,affiliations:[OWNER,COLLABORATOR,ORGANIZATION_MEMBER],orderBy:{field:UPDATED_AT,direction:DESC}){totalCount pageInfo{hasNextPage endCursor} nodes{name owner{login} description isPrivate isArchived isFork updatedAt viewerPermission}}}}"#;
+const GH_REPOSITORY_SEARCH_QUERY: &str = r#"query($first:Int!,$after:String,$search:String!){search(type:REPOSITORY,query:$search,first:$first,after:$after){repositoryCount pageInfo{hasNextPage endCursor} nodes{... on Repository{name owner{login} description isPrivate isArchived isFork updatedAt viewerPermission}}}}"#;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum GitHubAccess {
@@ -55,6 +60,41 @@ pub struct ResolveOptions {
     pub url: String,
     #[serde(default)]
     pub selection: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ListRepositoriesOptions {
+    #[serde(default)]
+    pub query: Option<String>,
+    #[serde(default)]
+    pub cursor: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitHubRepository {
+    pub name_with_owner: String,
+    pub url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    pub is_private: bool,
+    pub is_archived: bool,
+    pub is_fork: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub viewer_permission: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitHubRepositoryPage {
+    pub repositories: Vec<GitHubRepository>,
+    pub total_count: u64,
+    pub has_next_page: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub end_cursor: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -273,6 +313,30 @@ impl GitHubClient {
                 .await
             }
         }
+    }
+
+    pub async fn list_repositories(
+        &self,
+        options: ListRepositoriesOptions,
+    ) -> RpcResult<GitHubRepositoryPage> {
+        let query = normalize_repository_query(options.query)?;
+        let cursor = normalize_repository_cursor(options.cursor)?;
+        let (git, gh) = tokio::join!(tooling::find(Tool::Git), tooling::find(Tool::Gh));
+        if git.is_none() || gh.is_none() {
+            return Err(RpcError::invalid(
+                "GITHUB_TOOLS_UNAVAILABLE",
+                "Git and GitHub CLI are required to browse GitHub repositories",
+            ));
+        }
+        let Some(executable) = gh else {
+            return Err(RpcError::invalid(
+                "GITHUB_TOOLS_UNAVAILABLE",
+                "Git and GitHub CLI are required to browse GitHub repositories",
+            ));
+        };
+        let arguments = github_repository_arguments(query.as_deref(), cursor.as_deref());
+        let body = run_gh_graphql_with_executable(&executable, &arguments).await?;
+        parse_repository_page(&body, query.is_some())
     }
 
     pub async fn latest_manager_release(
@@ -887,10 +951,371 @@ impl GitHubClient {
     }
 }
 
+#[derive(Debug, Deserialize)]
+struct GraphQlResponse<T> {
+    data: Option<T>,
+    #[serde(default)]
+    errors: Vec<GraphQlError>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GraphQlError {
+    #[serde(default)]
+    message: String,
+    #[serde(default)]
+    extensions: serde_json::Value,
+}
+
+#[derive(Debug, Deserialize)]
+struct ViewerRepositoryData {
+    viewer: ViewerRepositories,
+}
+
+#[derive(Debug, Deserialize)]
+struct ViewerRepositories {
+    repositories: RepositoryConnection,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SearchRepositoryData {
+    search: SearchRepositoryConnection,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RepositoryConnection {
+    total_count: u64,
+    page_info: RepositoryPageInfo,
+    #[serde(default)]
+    nodes: Vec<Option<RepositoryNode>>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SearchRepositoryConnection {
+    repository_count: u64,
+    page_info: RepositoryPageInfo,
+    #[serde(default)]
+    nodes: Vec<Option<RepositoryNode>>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RepositoryPageInfo {
+    has_next_page: bool,
+    end_cursor: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RepositoryNode {
+    name: String,
+    owner: RepositoryOwner,
+    description: Option<String>,
+    is_private: bool,
+    is_archived: bool,
+    is_fork: bool,
+    updated_at: Option<String>,
+    viewer_permission: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RepositoryOwner {
+    login: String,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum GhOutputKind {
     Json,
     Archive,
+}
+
+fn normalize_repository_query(value: Option<String>) -> RpcResult<Option<String>> {
+    let value = value.unwrap_or_default();
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(None);
+    }
+    if value.len() > 256
+        || value.chars().count() > 120
+        || value.chars().any(|character| character.is_control())
+    {
+        return Err(RpcError::invalid(
+            "INVALID_GITHUB_QUERY",
+            "GitHub repository search must be 120 characters or fewer",
+        ));
+    }
+    Ok(Some(value.to_owned()))
+}
+
+fn normalize_repository_cursor(value: Option<String>) -> RpcResult<Option<String>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    if value.is_empty()
+        || value.len() > 512
+        || !value.is_ascii()
+        || value
+            .bytes()
+            .any(|byte| byte.is_ascii_control() || byte.is_ascii_whitespace())
+    {
+        return Err(RpcError::invalid(
+            "INVALID_GITHUB_CURSOR",
+            "GitHub repository cursor is invalid",
+        ));
+    }
+    Ok(Some(value))
+}
+
+fn github_repository_arguments(query: Option<&str>, cursor: Option<&str>) -> Vec<OsString> {
+    let graph_query = if query.is_some() {
+        GH_REPOSITORY_SEARCH_QUERY
+    } else {
+        GH_REPOSITORY_QUERY
+    };
+    let mut arguments = vec![
+        OsString::from("api"),
+        OsString::from("--hostname"),
+        OsString::from("github.com"),
+        OsString::from("--method"),
+        OsString::from("POST"),
+        OsString::from("-H"),
+        OsString::from("Accept: application/vnd.github+json"),
+        OsString::from("-H"),
+        OsString::from("X-GitHub-Api-Version: 2022-11-28"),
+        OsString::from("graphql"),
+        OsString::from("-f"),
+        OsString::from(format!("query={graph_query}")),
+        OsString::from("-F"),
+        OsString::from(format!("first={GH_REPOSITORY_PAGE_SIZE}")),
+    ];
+    if let Some(cursor) = cursor {
+        arguments.push(OsString::from("-f"));
+        arguments.push(OsString::from(format!("after={cursor}")));
+    }
+    if let Some(query) = query {
+        arguments.push(OsString::from("-f"));
+        arguments.push(OsString::from(format!(
+            "search={query} in:name,description"
+        )));
+    }
+    arguments
+}
+
+async fn run_gh_graphql_with_executable(
+    executable: &Path,
+    arguments: &[OsString],
+) -> RpcResult<Vec<u8>> {
+    let mut command = Command::new(executable);
+    command
+        .args(arguments)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GCM_INTERACTIVE", "Never")
+        .env("GH_PROMPT_DISABLED", "1")
+        .env("GH_NO_UPDATE_NOTIFIER", "1")
+        .env("GH_NO_EXTENSION_UPDATE_NOTIFIER", "1")
+        .env("GH_PAGER", "cat")
+        .env("PAGER", "cat")
+        .env("NO_COLOR", "1")
+        .env("CLICOLOR", "0")
+        .kill_on_drop(true);
+    configure_hidden_command(&mut command);
+
+    let mut child = command.spawn().map_err(|_| {
+        RpcError::invalid(
+            "GITHUB_CLI_UNAVAILABLE",
+            "GitHub CLI could not be started; reinstall it or check its permissions",
+        )
+    })?;
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| RpcError::internal("GitHub CLI stdout was unavailable"))?;
+    let operation = async {
+        let bytes =
+            read_bounded_gh_output(&mut stdout, GH_REPOSITORY_JSON_BYTES, GhOutputKind::Json)
+                .await?;
+        let status = child.wait().await.map_err(RpcError::io)?;
+        Ok::<_, RpcError>((status, bytes))
+    };
+    let (status, body) = match tokio::time::timeout(GH_JSON_TIMEOUT, operation).await {
+        Ok(Ok(outcome)) => outcome,
+        Ok(Err(error)) => {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            return Err(error);
+        }
+        Err(_) => {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            return Err(RpcError::new(
+                "GITHUB_CLI_TIMEOUT",
+                "GitHub CLI did not finish in time",
+                true,
+            ));
+        }
+    };
+    if status.success() {
+        return Ok(body);
+    }
+    if graph_ql_is_rate_limited(&body) {
+        return Err(RpcError::new(
+            "GITHUB_RATE_LIMITED",
+            "GitHub rate limit was reached",
+            true,
+        ));
+    }
+    if status.code() == Some(4) {
+        return Err(RpcError::invalid(
+            "GITHUB_CLI_AUTH_REQUIRED",
+            "GitHub CLI is not signed in; run gh auth login for github.com",
+        ));
+    }
+    Err(RpcError::new(
+        "GITHUB_CLI_REQUEST_FAILED",
+        "GitHub CLI could not list repositories; check gh auth status and repository access",
+        false,
+    ))
+}
+
+fn parse_repository_page(body: &[u8], searched: bool) -> RpcResult<GitHubRepositoryPage> {
+    if searched {
+        let response: GraphQlResponse<SearchRepositoryData> = parse_graph_ql_response(body)?;
+        let connection = response.data.ok_or_else(invalid_graph_ql_response)?.search;
+        normalize_repository_page(
+            connection.nodes,
+            connection.repository_count,
+            connection.page_info,
+        )
+    } else {
+        let response: GraphQlResponse<ViewerRepositoryData> = parse_graph_ql_response(body)?;
+        let connection = response
+            .data
+            .ok_or_else(invalid_graph_ql_response)?
+            .viewer
+            .repositories;
+        normalize_repository_page(
+            connection.nodes,
+            connection.total_count,
+            connection.page_info,
+        )
+    }
+}
+
+fn parse_graph_ql_response<T>(body: &[u8]) -> RpcResult<GraphQlResponse<T>>
+where
+    T: for<'de> Deserialize<'de>,
+{
+    let response: GraphQlResponse<T> =
+        serde_json::from_slice(body).map_err(|_| invalid_graph_ql_response())?;
+    if graph_ql_errors_are_rate_limited(&response.errors) {
+        return Err(RpcError::new(
+            "GITHUB_RATE_LIMITED",
+            "GitHub rate limit was reached",
+            true,
+        ));
+    }
+    if !response.errors.is_empty() {
+        return Err(RpcError::invalid(
+            "GITHUB_CLI_REQUEST_FAILED",
+            "GitHub could not list repositories for the signed-in account",
+        ));
+    }
+    Ok(response)
+}
+
+fn invalid_graph_ql_response() -> RpcError {
+    RpcError::invalid(
+        "INVALID_GITHUB_RESPONSE",
+        "GitHub returned an invalid repository list",
+    )
+}
+
+fn graph_ql_is_rate_limited(body: &[u8]) -> bool {
+    serde_json::from_slice::<GraphQlResponse<serde_json::Value>>(body)
+        .ok()
+        .is_some_and(|response| graph_ql_errors_are_rate_limited(&response.errors))
+}
+
+fn graph_ql_errors_are_rate_limited(errors: &[GraphQlError]) -> bool {
+    errors.iter().any(|error| {
+        error
+            .extensions
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|kind| kind.eq_ignore_ascii_case("RATE_LIMITED"))
+            || error.message.to_ascii_lowercase().contains("rate limit")
+    })
+}
+
+fn normalize_repository_page(
+    nodes: Vec<Option<RepositoryNode>>,
+    total_count: u64,
+    page_info: RepositoryPageInfo,
+) -> RpcResult<GitHubRepositoryPage> {
+    let repositories = nodes
+        .into_iter()
+        .flatten()
+        .map(normalize_repository)
+        .collect::<RpcResult<Vec<_>>>()?;
+    let end_cursor = normalize_repository_cursor(page_info.end_cursor)?;
+    if page_info.has_next_page && end_cursor.is_none() {
+        return Err(invalid_graph_ql_response());
+    }
+    Ok(GitHubRepositoryPage {
+        repositories,
+        total_count,
+        has_next_page: page_info.has_next_page,
+        end_cursor,
+    })
+}
+
+fn normalize_repository(node: RepositoryNode) -> RpcResult<GitHubRepository> {
+    let owner = validate_identifier(&node.owner.login, "owner")?;
+    let repository = validate_identifier(&node.name, "repository")?;
+    let name_with_owner = format!("{owner}/{repository}");
+    let description = sanitize_repository_text(node.description, 240);
+    let updated_at = sanitize_repository_text(node.updated_at, 64);
+    let viewer_permission = sanitize_repository_text(node.viewer_permission, 32);
+    Ok(GitHubRepository {
+        url: format!("https://github.com/{name_with_owner}"),
+        name_with_owner,
+        description,
+        is_private: node.is_private,
+        is_archived: node.is_archived,
+        is_fork: node.is_fork,
+        updated_at,
+        viewer_permission,
+    })
+}
+
+fn sanitize_repository_text(value: Option<String>, maximum_bytes: usize) -> Option<String> {
+    let value = value?;
+    let mut result = String::new();
+    let mut last_was_space = false;
+    for character in value.trim().chars() {
+        let character = if character.is_control() {
+            ' '
+        } else {
+            character
+        };
+        let is_space = character.is_whitespace();
+        if is_space && last_was_space {
+            continue;
+        }
+        let character = if is_space { ' ' } else { character };
+        if result.len() + character.len_utf8() > maximum_bytes {
+            break;
+        }
+        result.push(character);
+        last_was_space = is_space;
+    }
+    let result = result.trim().to_owned();
+    (!result.is_empty()).then_some(result)
 }
 
 async fn run_gh_api(
@@ -1973,6 +2398,165 @@ printf '%s' '{"ok":true}'
         );
         assert!(encode_github_path_value("bad\nref", "repository ref").is_err());
         assert!(encode_github_path_value(&"x".repeat(256), "repository ref").is_err());
+    }
+
+    #[test]
+    fn repository_browser_parameters_are_bounded_and_normalized() {
+        assert_eq!(
+            normalize_repository_query(Some("  animation tools  ".to_owned())).unwrap(),
+            Some("animation tools".to_owned())
+        );
+        assert_eq!(
+            normalize_repository_query(Some("  ".to_owned())).unwrap(),
+            None
+        );
+        assert!(normalize_repository_query(Some("x".repeat(121))).is_err());
+        assert!(normalize_repository_query(Some("bad\nquery".to_owned())).is_err());
+
+        assert_eq!(
+            normalize_repository_cursor(Some("Y3Vyc29yOnYyOpHO".to_owned())).unwrap(),
+            Some("Y3Vyc29yOnYyOpHO".to_owned())
+        );
+        assert!(normalize_repository_cursor(Some(String::new())).is_err());
+        assert!(normalize_repository_cursor(Some("bad cursor".to_owned())).is_err());
+        assert!(normalize_repository_cursor(Some("x".repeat(513))).is_err());
+    }
+
+    #[test]
+    fn repository_browser_uses_only_fixed_graphql_arguments() {
+        let plain = github_repository_arguments(None, None);
+        assert_eq!(
+            plain,
+            vec![
+                "api",
+                "--hostname",
+                "github.com",
+                "--method",
+                "POST",
+                "-H",
+                "Accept: application/vnd.github+json",
+                "-H",
+                "X-GitHub-Api-Version: 2022-11-28",
+                "graphql",
+                "-f",
+                &format!("query={GH_REPOSITORY_QUERY}"),
+                "-F",
+                "first=6",
+            ]
+            .into_iter()
+            .map(OsString::from)
+            .collect::<Vec<_>>()
+        );
+
+        let searched = github_repository_arguments(Some("animation"), Some("cursor=="));
+        assert!(searched.contains(&OsString::from(format!(
+            "query={GH_REPOSITORY_SEARCH_QUERY}"
+        ))));
+        assert!(searched.contains(&OsString::from("after=cursor==")));
+        assert!(searched.contains(&OsString::from("search=animation in:name,description")));
+        for dynamic in ["after=cursor==", "search=animation in:name,description"] {
+            let index = searched
+                .iter()
+                .position(|argument| argument == dynamic)
+                .expect("dynamic argument");
+            assert_eq!(searched[index - 1], "-f");
+        }
+    }
+
+    #[test]
+    fn repository_pages_are_normalized_without_trusting_urls() {
+        let body = br#"{
+          "data": {
+            "viewer": {
+              "repositories": {
+                "totalCount": 7,
+                "pageInfo": {"hasNextPage": true, "endCursor": "next=="},
+                "nodes": [{
+                  "name": "Private.Extension",
+                  "owner": {"login": "example-owner"},
+                  "description": "  One\n  useful   extension  ",
+                  "isPrivate": true,
+                  "isArchived": false,
+                  "isFork": false,
+                  "updatedAt": "2026-08-30T12:00:00Z",
+                  "viewerPermission": "ADMIN"
+                }]
+              }
+            }
+          }
+        }"#;
+        let page = parse_repository_page(body, false).unwrap();
+        assert_eq!(page.total_count, 7);
+        assert!(page.has_next_page);
+        assert_eq!(page.end_cursor.as_deref(), Some("next=="));
+        assert_eq!(page.repositories.len(), 1);
+        let repository = &page.repositories[0];
+        assert_eq!(
+            repository.name_with_owner,
+            "example-owner/Private.Extension"
+        );
+        assert_eq!(
+            repository.url,
+            "https://github.com/example-owner/Private.Extension"
+        );
+        assert_eq!(
+            repository.description.as_deref(),
+            Some("One useful extension")
+        );
+        assert!(repository.is_private);
+        assert_eq!(repository.viewer_permission.as_deref(), Some("ADMIN"));
+    }
+
+    #[test]
+    fn repository_search_pages_and_graphql_errors_are_classified() {
+        let search = br#"{
+          "data": {
+            "search": {
+              "repositoryCount": 1,
+              "pageInfo": {"hasNextPage": false, "endCursor": null},
+              "nodes": [{
+                "name": "public-extension",
+                "owner": {"login": "someone"},
+                "description": null,
+                "isPrivate": false,
+                "isArchived": false,
+                "isFork": true,
+                "updatedAt": null,
+                "viewerPermission": "READ"
+              }]
+            }
+          }
+        }"#;
+        let page = parse_repository_page(search, true).unwrap();
+        assert_eq!(page.total_count, 1);
+        assert!(!page.has_next_page);
+        assert!(page.end_cursor.is_none());
+        assert_eq!(
+            page.repositories[0].name_with_owner,
+            "someone/public-extension"
+        );
+
+        let limited = br#"{
+          "data": null,
+          "errors": [{"message":"API rate limit exceeded","extensions":{"type":"RATE_LIMITED"}}]
+        }"#;
+        let error = parse_repository_page(limited, false).unwrap_err();
+        assert_eq!(error.code, "GITHUB_RATE_LIMITED");
+        assert!(error.retryable);
+
+        let malformed = parse_repository_page(br#"{"data":{}}"#, false).unwrap_err();
+        assert_eq!(malformed.code, "INVALID_GITHUB_RESPONSE");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn repository_browser_maps_cli_authentication_failure() {
+        let (_directory, executable) = fake_gh("#!/bin/sh\nexit 4\n");
+        let arguments = github_repository_arguments(None, None);
+        let error = run_gh_graphql_with_executable(&executable, &arguments)
+            .await
+            .expect_err("exit 4 requires GitHub CLI authentication");
+        assert_eq!(error.code, "GITHUB_CLI_AUTH_REQUIRED");
     }
 
     #[tokio::test]

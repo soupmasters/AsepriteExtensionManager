@@ -1,0 +1,26 @@
+[package]
+name = "aem-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Command-line client for Aseprite Extension Manager"
+
+[[bin]]
+name = "aem"
+path = "src/main.rs"
+
+[dependencies]
+aem-helper = { path = "../helper" }
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+clap = { version = "4.5", features = ["derive"] }
+opener = "0.8"
+semver = "1.0"
+serde_json = "1.0"
+tempfile = "3.10"
+tokio = { version = "1.39", features = ["macros", "rt-multi-thread"] }
+
+[dev-dependencies]
+zip = { version = "2.2", default-features = false, features = ["deflate"] }

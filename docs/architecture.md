@@ -7,7 +7,7 @@ Aseprite process. The profile root comes from `app.fs.userConfigPath`; the
 location of the Aseprite application and its store or distribution channel are
 irrelevant.
 
-The manager has three runtime parts:
+The manager has three in-app runtime parts:
 
 1. `extension/` contains the Lua entry point, native dialogs, preferences, and
    the WebSocket client.
@@ -15,6 +15,12 @@ The manager has three runtime parts:
    local-folder operations.
 3. `registry/bundled` contains a pinned root and the authenticated curated
    catalog generated from `registry/catalog-v1.json`.
+
+The optional `aem` command-line client reuses the Rust package, GitHub,
+registry, verification, cache, receipt, and diagnostic code. It discovers the
+selected Aseprite profile outside the app. Final installation still belongs to
+Aseprite: the CLI opens the staged package, waits for the native confirmation,
+then verifies the installed files before recording success.
 
 The packaged helpers are selected by the Lua layer:
 
@@ -151,6 +157,7 @@ All mutable state is beneath:
 
 ```text
 <userConfigPath>/extension-manager/
+├── manager.lock
 ├── cache/
 │   └── <package-id>/
 │       ├── current.aseprite-extension

@@ -226,7 +226,32 @@ pub fn verify(
     expected_name: &str,
     expected_version: &str,
 ) -> RpcResult<InstalledPackage> {
-    let package = find(user_config_path, state, expected_name)?.ok_or_else(|| {
+    let mut matches = scan(user_config_path, state)?
+        .into_iter()
+        .filter(|package| package.name.eq_ignore_ascii_case(expected_name))
+        .collect::<Vec<_>>();
+    if matches.len() > 1 {
+        let candidates = matches
+            .iter()
+            .map(|package| {
+                serde_json::json!({
+                    "name": package.name,
+                    "version": package.version,
+                    "path": package.path,
+                })
+            })
+            .collect::<Vec<_>>();
+        return Err(RpcError::invalid(
+            "INSTALL_VERIFICATION_FAILED",
+            "more than one installed extension uses the expected package name",
+        )
+        .with_details(serde_json::json!({
+            "expectedName": expected_name,
+            "matchCount": candidates.len(),
+            "candidates": candidates,
+        })));
+    }
+    let package = matches.pop().ok_or_else(|| {
         RpcError::invalid(
             "INSTALL_VERIFICATION_FAILED",
             "Aseprite did not install the expected package",
@@ -634,6 +659,61 @@ mod tests {
         assert!(!packages[0].managed);
         assert!(packages[0].source.is_none());
         assert!(!packages[0].rollback_available);
+    }
+
+    #[test]
+    fn verify_accepts_one_matching_installed_package() {
+        let temporary = tempfile::tempdir().expect("tempdir");
+        let extension = temporary.path().join("extensions").join("sample");
+        fs::create_dir_all(&extension).expect("mkdir");
+        fs::write(
+            extension.join("package.json"),
+            br#"{"name":"sample","version":"1.0.0"}"#,
+        )
+        .expect("manifest");
+        let state = State::new(temporary.path()).expect("state");
+
+        let installed =
+            verify(temporary.path(), &state, "SAMPLE", "1.0.0").expect("verified package");
+
+        assert_eq!(installed.name, "sample");
+        assert_eq!(installed.version, "1.0.0");
+        assert_eq!(installed.path, extension);
+    }
+
+    #[test]
+    fn verify_rejects_duplicate_package_names_case_insensitively() {
+        let temporary = tempfile::tempdir().expect("tempdir");
+        let extensions = temporary.path().join("extensions");
+        for (folder, name) in [("sample-one", "sample"), ("sample-two", "SAMPLE")] {
+            let extension = extensions.join(folder);
+            fs::create_dir_all(&extension).expect("mkdir");
+            fs::write(
+                extension.join("package.json"),
+                format!(r#"{{"name":"{name}","version":"1.0.0"}}"#),
+            )
+            .expect("manifest");
+        }
+        let state = State::new(temporary.path()).expect("state");
+
+        let error = verify(temporary.path(), &state, "sample", "1.0.0")
+            .expect_err("duplicate package names must be ambiguous");
+
+        assert_eq!(error.code, "INSTALL_VERIFICATION_FAILED");
+        assert_eq!(
+            error.message,
+            "more than one installed extension uses the expected package name"
+        );
+        let details = error.details.expect("duplicate details");
+        assert_eq!(details["expectedName"], "sample");
+        assert_eq!(details["matchCount"], 2);
+        assert_eq!(
+            details["candidates"]
+                .as_array()
+                .expect("candidate array")
+                .len(),
+            2
+        );
     }
 
     #[test]

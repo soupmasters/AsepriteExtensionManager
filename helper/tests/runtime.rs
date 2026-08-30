@@ -273,6 +273,7 @@ async fn linked_local_package_detects_same_version_content_updates() {
     let installed = user_config.join("extensions/linked-local");
     fs::create_dir_all(&installed).expect("installed extension directory");
     fs::write(installed.join("package.json"), manifest).expect("installed manifest");
+    fs::write(installed.join("main.lua"), b"return 'first'\n").expect("installed script");
     let verified = rpc_request(
         &mut socket,
         "verify-local",

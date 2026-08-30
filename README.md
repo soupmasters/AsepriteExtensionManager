@@ -9,6 +9,17 @@ extensions from a bundled catalog, GitHub, or a local folder.
 
 The project is still in development.
 
+## CLI
+
+```sh
+cargo install --locked --path cli
+aem search animation
+aem install unity-event-for-aseprite
+```
+
+`aem install` also accepts a GitHub URL or local extension folder. Aseprite
+shows the final install confirmation.
+
 ## Development
 
 Quit Aseprite and deploy your local changes with:

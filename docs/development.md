@@ -39,6 +39,41 @@ set. A different profile can be selected explicitly:
 cargo deploy-local --user-config "/path/to/Aseprite"
 ```
 
+## Command-line client
+
+Install the development CLI into Cargo's binary directory:
+
+```sh
+cargo install --locked --path cli
+aem doctor
+```
+
+The main commands are:
+
+```sh
+aem install unity-event-for-aseprite
+aem install https://github.com/owner/repository
+aem install ./my-local-extension
+aem list
+aem search animation
+aem doctor
+```
+
+`install` resolves, downloads, validates, and stages the package. It then opens
+the package with Aseprite, waits for the native confirmation, verifies every
+installed package file, and writes the managed receipt. Use `--asset` when a
+GitHub release has several extension assets. Use `--prepare-only` to validate
+and stage a package without opening Aseprite.
+
+The CLI uses `--user-config`, then `ASEPRITE_USER_FOLDER`, then the normal
+profile path for the current platform. An install into a custom or portable
+profile must also pass `--aseprite PATH`. The CLI starts that executable with
+`ASEPRITE_USER_FOLDER` set to the selected profile, so Aseprite and post-install
+verification use the same location. `--aseprite` accepts the executable or a
+macOS `.app` bundle. The installed manager supplies the trusted catalog. The CLI
+and the in-app helper take an exclusive per-profile lock while changing manager
+state, so close the manager window before running `aem install`.
+
 The checked-in `extension/` directory intentionally contains no helper
 binaries. Build helpers and stage a complete package before validation.
 
@@ -105,6 +140,9 @@ security advisory checks.
 - a macOS universal arm64 and x86_64 helper;
 - a Windows x86_64 helper;
 - a Linux x86_64 musl helper using the rustls network stack.
+
+It also builds the standalone `aem` CLI as a universal macOS archive, a Windows
+x86_64 zip, and a static Linux x86_64 musl archive.
 
 Each native job smoke-runs its helper. The assembly job stages all three,
 creates the archive twice, compares bytes, validates content and modes, confirms

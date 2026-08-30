@@ -14,6 +14,7 @@ local RESIZE_DEBOUNCE_SECONDS = 0.1
 local DEFAULT_MANAGER_WIDTH = 720
 local DEFAULT_CONFIRM_WIDTH = 560
 local CONFIRM_LINE_COLUMNS = 64
+local PACKAGE_MENU_COLUMNS = 72
 local MANAGER_WINDOW_MARGIN = 16
 local FALLBACK_INLINE_WIDTH = 560
 local WIDTH_PRESERVING_AUTOFIT = Align and Align.TOP or 0
@@ -244,6 +245,22 @@ local function narrow_installed_row(package)
   }, " · ")
 end
 
+local function github_repository_row(repository)
+  local parts = {
+    text(repository.nameWithOwner, "Unnamed repository"),
+    repository.isPrivate and "Private" or "Public",
+  }
+  if repository.isArchived then
+    parts[#parts + 1] = "Archived"
+  elseif repository.isFork then
+    parts[#parts + 1] = "Fork"
+  end
+  if type(repository.updatedAt) == "string" and repository.updatedAt ~= "" then
+    parts[#parts + 1] = "Updated " .. repository.updatedAt:sub(1, 10)
+  end
+  return table.concat(parts, " · ")
+end
+
 local function show_responsive(dialog, options)
   options = options or {}
   options.autoscrollbars = true
@@ -304,6 +321,23 @@ local function utf8_prefix(value, length)
     end
   end
   return value:sub(1, length), value:sub(length + 1)
+end
+
+local function package_menu_line(label, value)
+  local line = label and label .. ": " .. tostring(value) or tostring(value)
+  if utf8_length(line) <= PACKAGE_MENU_COLUMNS then
+    return line
+  end
+  local prefix = utf8_prefix(line, PACKAGE_MENU_COLUMNS - 1)
+  return prefix .. "…"
+end
+
+local function add_package_menu_info(menu, id, label, value)
+  menu:menuItem {
+    id = id,
+    text = package_menu_line(label, value),
+    enabled = false,
+  }
 end
 
 local function wrapped_text_lines(value, columns)
@@ -552,15 +586,27 @@ local function add_search_control(ui, dialog, kind, supports_same_row)
     }
     dialog:samerow()
   end
+  local search_text
+  if kind == "browse" then
+    search_text = ui.model.browseSearch
+  elseif kind == "installed" then
+    search_text = ui.model.installedSearch
+  else
+    search_text = ui.model.githubSearch
+  end
   dialog:entry {
     id = id,
     label = not supports_same_row and "Search:" or nil,
-    text = kind == "browse" and ui.model.browseSearch or ui.model.installedSearch,
+    text = search_text,
     hexpand = true,
     visible = active,
     onchange = function()
-      ui.model:set_search(kind, dialog.data[id])
-      ui:refresh()
+      if kind == "github" then
+        ui.controller:search_github_repositories(dialog.data[id])
+      else
+        ui.model:set_search(kind, dialog.data[id])
+        ui:refresh()
+      end
     end,
   }
 end
@@ -589,8 +635,12 @@ local function add_pager(ui, dialog, kind, supports_same_row)
     hexpand = false,
     visible = active,
     onclick = function()
-      ui.model:move_page(kind, -1)
-      ui:refresh()
+      if kind == "github" then
+        ui.controller:move_github_page(-1)
+      else
+        ui.model:move_page(kind, -1)
+        ui:refresh()
+      end
     end,
   }
   stay_on_row()
@@ -619,8 +669,12 @@ local function add_pager(ui, dialog, kind, supports_same_row)
     hexpand = false,
     visible = active,
     onclick = function()
-      ui.model:move_page(kind, 1)
-      ui:refresh()
+      if kind == "github" then
+        ui.controller:move_github_page(1)
+      else
+        ui.model:move_page(kind, 1)
+        ui:refresh()
+      end
     end,
   }
   if supports_same_row then
@@ -642,7 +696,8 @@ local function update_pager(
   pages,
   busy,
   supports_same_row,
-  update_visibility
+  update_visibility,
+  can_move_next
 )
   local active = update_visibility == true
   local visible = true
@@ -658,7 +713,10 @@ local function update_pager(
   }
   local next_update = {
     id = kind .. "_next",
-    enabled = visible and page < pages and not busy,
+    enabled = visible
+      and page < pages
+      and can_move_next ~= false
+      and not busy,
     visible = active and visible,
   }
   dialog:modify(page_update)
@@ -728,6 +786,10 @@ function Ui.new(environment, model)
     dialog = nil,
     browseRows = {},
     installedRows = {},
+    githubRows = {},
+    githubAvailable = false,
+    githubAuthenticated = false,
+    githubDiagnosticsTicket = nil,
     suppressClose = false,
     supportsSameRow = false,
     responsiveReady = false,
@@ -736,11 +798,62 @@ function Ui.new(environment, model)
     layoutTimer = nil,
     pendingLayoutWidth = nil,
     activeView = "browse",
+    screen = "manager",
   }, Ui)
 end
 
 function Ui:_parent()
   return self.dialog
+end
+
+function Ui:_cancel_github_diagnostics()
+  local ticket = self.githubDiagnosticsTicket
+  self.githubDiagnosticsTicket = nil
+  if ticket then
+    ticket.cancel()
+  end
+end
+
+function Ui:_check_github_tools()
+  self:_cancel_github_diagnostics()
+  local dialog = self.dialog
+  if not dialog
+    or not self.controller
+    or type(self.controller.request_diagnostics) ~= "function"
+  then
+    return false
+  end
+
+  local completed = false
+  local ticket = self.controller:request_diagnostics(function(result, error_value)
+    completed = true
+    if self.dialog ~= dialog then
+      return
+    end
+    self.githubDiagnosticsTicket = nil
+    local tools = type(result) == "table" and result.tools or nil
+    local git = type(tools) == "table" and tools.git or nil
+    local gh = type(tools) == "table" and tools.gh or nil
+    self.githubAvailable = error_value == nil
+      and type(git) == "table"
+      and git.installed == true
+      and type(gh) == "table"
+      and gh.installed == true
+    self.githubAuthenticated = self.githubAvailable and gh.authenticated == true
+    self:refresh()
+    if self.githubAuthenticated
+      and self.activeView == "github"
+      and not self.model.githubLoaded
+      and not self.model.githubLoading
+      and type(self.controller.search_github_repositories) == "function"
+    then
+      self.controller:search_github_repositories(self.model.githubSearch)
+    end
+  end)
+  if not completed then
+    self.githubDiagnosticsTicket = ticket
+  end
+  return ticket ~= nil
 end
 
 function Ui:_stop_layout_timer()
@@ -768,8 +881,10 @@ end
 function Ui:_row_package(kind, index)
   if kind == "browse" then
     return self.browseRows[index]
+  elseif kind == "installed" then
+    return self.installedRows[index]
   end
-  return self.installedRows[index]
+  return self.githubRows[index]
 end
 
 function Ui:_row_text(kind, package)
@@ -779,17 +894,75 @@ function Ui:_row_text(kind, package)
   if self.supportsSameRow and self.rowsStacked then
     if kind == "browse" then
       return narrow_catalog_row(package)
+    elseif kind == "installed" then
+      return narrow_installed_row(package)
     end
-    return narrow_installed_row(package)
+    return github_repository_row(package)
   end
   if kind == "browse" then
     return catalog_row(package)
+  elseif kind == "installed" then
+    return installed_row(package)
   end
-  return installed_row(package)
+  return github_repository_row(package)
 end
 
 function Ui:_is_active_view(kind)
-  return self.activeView == kind
+  return self.screen == "manager" and self.activeView == kind
+end
+
+function Ui:_update_screen_controls()
+  local dialog = self.dialog
+  if not dialog then
+    return
+  end
+  local manager_visible = self.screen == "manager"
+  for _, id in ipairs({
+    "manager_tabs",
+    "manager_footer_separator",
+    "manager_status",
+    "install",
+    "refresh",
+    "preferences",
+    "help",
+  }) do
+    dialog:modify {
+      id = id,
+      visible = manager_visible,
+    }
+  end
+  if self.supportsSameRow then
+    dialog:modify {
+      id = "manager_footer_lead",
+      visible = manager_visible,
+    }
+  end
+  for _, id in ipairs({
+    "preferences_back",
+    "preferences_title",
+    "startup_checks",
+    "preferences_description",
+    "preferences_local_data",
+    "preferences_data_path",
+    "preferences_clear_cache",
+  }) do
+    dialog:modify {
+      id = id,
+      visible = not manager_visible,
+    }
+  end
+  dialog:modify {
+    id = "preferences_clear_cache",
+    enabled = not self.model.busy,
+  }
+end
+
+function Ui:_show_manager_screen()
+  if self.screen == "manager" then
+    return
+  end
+  self.screen = "manager"
+  self:refresh()
 end
 
 function Ui:_activate_tab(tab)
@@ -798,11 +971,22 @@ function Ui:_activate_tab(tab)
     kind = "browse"
   elseif tab == "installed_tab" then
     kind = "installed"
+  elseif tab == "github_tab" and self.githubAvailable then
+    kind = "github"
   end
   if not kind or self.activeView == kind then
     return
   end
   self.activeView = kind
+  if kind == "github"
+    and self.githubAuthenticated
+    and not self.model.githubLoaded
+    and not self.model.githubLoading
+    and self.controller
+    and type(self.controller.search_github_repositories) == "function"
+  then
+    self.controller:search_github_repositories(self.model.githubSearch)
+  end
   if self.responsiveReady then
     self:refresh()
   end
@@ -823,6 +1007,7 @@ function Ui:_update_search_control(kind)
   dialog:modify {
     id = kind .. "_search",
     visible = active,
+    enabled = kind ~= "github" or self.githubAuthenticated,
   }
 end
 
@@ -835,11 +1020,13 @@ function Ui:_update_row_controls(kind, index)
   local present = package ~= nil
   local stacked = self.supportsSameRow and self.rowsStacked
   local active = self:_is_active_view(kind)
+  local enabled = not self.model.busy
+    and (kind ~= "github" or (self.githubAuthenticated and not self.model.githubLoading))
   if not self.supportsSameRow then
     local details_update = {
       id = kind .. "_details_" .. tostring(index),
       label = self:_row_text(kind, package),
-      enabled = not self.model.busy,
+      enabled = enabled,
       visible = active and present,
     }
     dialog:modify(details_update)
@@ -852,7 +1039,7 @@ function Ui:_update_row_controls(kind, index)
   }
   local details_update = {
     id = kind .. "_details_" .. tostring(index),
-    enabled = not self.model.busy,
+    enabled = enabled,
     visible = active and present and not stacked,
   }
   dialog:modify(row_update)
@@ -860,7 +1047,7 @@ function Ui:_update_row_controls(kind, index)
   if self.supportsSameRow then
     local stacked_details_update = {
       id = kind .. "_stacked_details_" .. tostring(index),
-      enabled = not self.model.busy,
+      enabled = enabled,
       visible = active and present and stacked,
     }
     dialog:modify(stacked_details_update)
@@ -903,8 +1090,10 @@ function Ui:_apply_row_layout(stacked, current_width)
     return
   end
   self.rowsStacked = stacked
-  for _, kind in ipairs({ "browse", "installed" }) do
-    self:_update_view_controls(kind)
+  for _, kind in ipairs({ "browse", "installed", "github" }) do
+    if VIEW_OPTIONS[kind] then
+      self:_update_view_controls(kind)
+    end
     for index = 1, self.model.pageSize do
       self:_update_row_controls(kind, index)
     end
@@ -1019,6 +1208,7 @@ function Ui:_build()
       self:_schedule_row_layout(dialog)
     end,
     onclose = function()
+      self:_cancel_github_diagnostics()
       self:_stop_layout_timer()
       self.responsiveReady = false
       if self.dialog == dialog then
@@ -1034,6 +1224,7 @@ function Ui:_build()
   self.rowsStacked = false
   self.wideRowMinWidth = nil
   self.activeView = "browse"
+  self.screen = "manager"
 
   dialog:tab {
     id = "browse_tab",
@@ -1046,11 +1237,14 @@ function Ui:_build()
     text = "",
     hexpand = true,
   }
+  if self.supportsSameRow then
+    dialog:newrow()
+  end
   for index = 1, self.model.pageSize do
     local row_index = index
     if self.supportsSameRow then
       dialog:label {
-        id = "browse_row_" .. tostring(index),
+        id = "browse_row_lead_" .. tostring(index),
         text = "",
         visible = false,
         hexpand = false,
@@ -1060,27 +1254,36 @@ function Ui:_build()
     dialog:button {
       id = "browse_details_" .. tostring(index),
       label = not self.supportsSameRow and "" or nil,
-      text = "Details",
+      text = "Details ▾",
       visible = false,
       hexpand = false,
       onclick = function()
         local package = self.browseRows[row_index]
         if package then
-          self:show_package_details(package, "browse")
+          self:show_package_menu(package, "browse")
         end
       end,
     }
+    if self.supportsSameRow then
+      dialog:samerow()
+      dialog:label {
+        id = "browse_row_" .. tostring(index),
+        text = "",
+        visible = false,
+        hexpand = false,
+      }
+    end
     dialog:newrow()
     if self.supportsSameRow then
       dialog:button {
         id = "browse_stacked_details_" .. tostring(index),
-        text = "Details",
+        text = "Details ▾",
         visible = false,
         hexpand = false,
         onclick = function()
           local package = self.browseRows[row_index]
           if package then
-            self:show_package_details(package, "browse")
+            self:show_package_menu(package, "browse")
           end
         end,
       }
@@ -1100,11 +1303,14 @@ function Ui:_build()
     text = "No user extensions were found.",
     hexpand = true,
   }
+  if self.supportsSameRow then
+    dialog:newrow()
+  end
   for index = 1, self.model.pageSize do
     local row_index = index
     if self.supportsSameRow then
       dialog:label {
-        id = "installed_row_" .. tostring(index),
+        id = "installed_row_lead_" .. tostring(index),
         text = "",
         visible = false,
         hexpand = false,
@@ -1114,27 +1320,36 @@ function Ui:_build()
     dialog:button {
       id = "installed_details_" .. tostring(index),
       label = not self.supportsSameRow and "" or nil,
-      text = "Details",
+      text = "Details ▾",
       visible = false,
       hexpand = false,
       onclick = function()
         local package = self.installedRows[row_index]
         if package then
-          self:show_package_details(package, "installed")
+          self:show_package_menu(package, "installed")
         end
       end,
     }
+    if self.supportsSameRow then
+      dialog:samerow()
+      dialog:label {
+        id = "installed_row_" .. tostring(index),
+        text = "",
+        visible = false,
+        hexpand = false,
+      }
+    end
     dialog:newrow()
     if self.supportsSameRow then
       dialog:button {
         id = "installed_stacked_details_" .. tostring(index),
-        text = "Details",
+        text = "Details ▾",
         visible = false,
         hexpand = false,
         onclick = function()
           local package = self.installedRows[row_index]
           if package then
-            self:show_package_details(package, "installed")
+            self:show_package_menu(package, "installed")
           end
         end,
       }
@@ -1142,6 +1357,76 @@ function Ui:_build()
     end
   end
   add_pager(self, dialog, "installed", self.supportsSameRow)
+
+  dialog:tab {
+    id = "github_tab",
+    text = "GitHub",
+    visible = false,
+    enabled = false,
+  }
+  add_search_control(self, dialog, "github", self.supportsSameRow)
+  dialog:label {
+    id = "github_empty",
+    text = "",
+    visible = false,
+    hexpand = true,
+  }
+  if self.supportsSameRow then
+    dialog:newrow()
+  end
+  for index = 1, self.model.pageSize do
+    local row_index = index
+    if self.supportsSameRow then
+      dialog:label {
+        id = "github_row_lead_" .. tostring(index),
+        text = "",
+        visible = false,
+        hexpand = false,
+      }
+      dialog:samerow()
+    end
+    dialog:button {
+      id = "github_details_" .. tostring(index),
+      label = not self.supportsSameRow and "" or nil,
+      text = "Install",
+      visible = false,
+      focus = false,
+      hexpand = false,
+      onclick = function()
+        local repository = self.githubRows[row_index]
+        if repository then
+          self.controller:install_github_repository(repository)
+        end
+      end,
+    }
+    if self.supportsSameRow then
+      dialog:samerow()
+      dialog:label {
+        id = "github_row_" .. tostring(index),
+        text = "",
+        visible = false,
+        hexpand = false,
+      }
+    end
+    dialog:newrow()
+    if self.supportsSameRow then
+      dialog:button {
+        id = "github_stacked_details_" .. tostring(index),
+        text = "Install",
+        visible = false,
+        focus = false,
+        hexpand = false,
+        onclick = function()
+          local repository = self.githubRows[row_index]
+          if repository then
+            self.controller:install_github_repository(repository)
+          end
+        end,
+      }
+      dialog:newrow()
+    end
+  end
+  add_pager(self, dialog, "github", self.supportsSameRow)
   dialog:endtabs {
     id = "manager_tabs",
     selected = "browse_tab",
@@ -1152,7 +1437,82 @@ function Ui:_build()
     end,
   }
 
-  dialog:separator {}
+  local preferences = self.environment.plugin.preferences
+  if self.supportsSameRow then
+    dialog:label {
+      id = "preferences_header_lead",
+      text = "",
+      visible = false,
+      hexpand = false,
+    }
+    dialog:samerow()
+  end
+  dialog:button {
+    id = "preferences_back",
+    text = "← Back",
+    visible = false,
+    focus = false,
+    hexpand = false,
+    onclick = function()
+      self:_show_manager_screen()
+    end,
+  }
+  if self.supportsSameRow then
+    dialog:samerow()
+  end
+  dialog:label {
+    id = "preferences_title",
+    text = "Preferences",
+    visible = false,
+    hexpand = false,
+  }
+  dialog:newrow()
+  dialog:check {
+    id = "startup_checks",
+    text = "Check for updates at startup",
+    selected = preferences.startupChecks ~= false,
+    visible = false,
+    onclick = function()
+      preferences.startupChecks = dialog.data.startup_checks == true
+    end,
+  }
+  dialog:label {
+    id = "preferences_description",
+    text = "Checks linked sources and manager releases at most once every 24 hours.",
+    visible = false,
+    hexpand = true,
+  }
+  dialog:separator {
+    id = "preferences_local_data",
+    text = "Local Data",
+    visible = false,
+  }
+  dialog:label {
+    id = "preferences_data_path",
+    text = self.app.fs.joinPath(self.app.fs.userConfigPath, "extension-manager"),
+    visible = false,
+    hexpand = true,
+  }
+  dialog:button {
+    id = "preferences_clear_cache",
+    text = "Clear Cache…",
+    visible = false,
+    focus = false,
+    hexpand = false,
+    onclick = function()
+      if self:confirm(
+        "Clear Download Cache",
+        "Remove cached package artifacts that are not needed for the current restore point?",
+        "Clear Cache"
+      ) then
+        self.controller:clear_cache()
+      end
+    end,
+  }
+
+  dialog:separator {
+    id = "manager_footer_separator",
+  }
   dialog:label {
     id = "manager_status",
     text = self.model.status,
@@ -1162,6 +1522,7 @@ function Ui:_build()
   local compact_footer = self.supportsSameRow
   if compact_footer then
     dialog:label {
+      id = "manager_footer_lead",
       text = "",
       hexpand = false,
     }
@@ -1214,6 +1575,7 @@ function Ui:_build()
     focus = false,
     hexpand = false,
     onclick = function()
+      self:_check_github_tools()
       self.controller:refresh(true)
     end,
   }
@@ -1261,9 +1623,11 @@ function Ui:open(controller)
     self.dialog.autofit = WIDTH_PRESERVING_AUTOFIT
   end)
   self:_schedule_row_layout(self.dialog)
+  self:_check_github_tools()
 end
 
 function Ui:close()
+  self:_cancel_github_diagnostics()
   self:_stop_layout_timer()
   self.responsiveReady = false
   local dialog = self.dialog
@@ -1367,6 +1731,45 @@ function Ui:refresh()
     self:_is_active_view("installed")
   )
 
+  dialog:modify {
+    id = "github_tab",
+    visible = self.githubAvailable,
+    enabled = self.githubAvailable,
+  }
+  local github, github_page, github_pages, github_count = self.model:page("github")
+  self.githubRows = github
+  local github_empty_message = ""
+  if not self.githubAuthenticated then
+    github_empty_message = "Sign in with gh auth login to browse accessible repositories."
+  elseif self.model.githubLoading then
+    github_empty_message = "Loading GitHub repositories..."
+  elseif self.model.githubError then
+    github_empty_message = Protocol.error_message(self.model.githubError)
+  elseif self.model.githubLoaded and github_count == 0 and self.model.githubSearch ~= "" then
+    github_empty_message = "No GitHub repositories match this search."
+  elseif self.model.githubLoaded and github_count == 0 then
+    github_empty_message = "No accessible GitHub repositories were found."
+  end
+  dialog:modify {
+    id = "github_empty",
+    text = github_empty_message,
+    visible = self:_is_active_view("github") and github_empty_message ~= "",
+  }
+  self:_update_search_control("github")
+  for index = 1, self.model.pageSize do
+    self:_update_row_controls("github", index)
+  end
+  update_pager(
+    dialog,
+    "github",
+    github_page,
+    github_pages,
+    self.model.busy or self.model.githubLoading,
+    self.supportsSameRow,
+    self:_is_active_view("github") and self.githubAuthenticated,
+    self.model.githubHasNextPage
+  )
+
   local manager_update = self_update_available(self.model.managerPackage)
   local status = self.model.status
   if manager_update then
@@ -1383,7 +1786,7 @@ function Ui:refresh()
   }
   dialog:modify {
     id = "manager_update",
-    visible = manager_update,
+    visible = self.screen == "manager" and manager_update,
     enabled = manager_update and not self.model.busy,
   }
   for _, id in ipairs({
@@ -1396,6 +1799,7 @@ function Ui:refresh()
       enabled = not self.model.busy,
     }
   end
+  self:_update_screen_controls()
   self:_capture_wide_row_width()
   self:_schedule_row_layout(dialog)
 end
@@ -1821,195 +2225,156 @@ function Ui:show_help()
 end
 
 function Ui:show_preferences()
-  local preferences = self.environment.plugin.preferences
-  local dialog = self.environment.Dialog {
-    title = "Extension Manager Preferences",
-    parent = self:_parent(),
-    resizeable = true,
-  }
-  dialog:check {
-    id = "startup_checks",
-    text = "Check for updates at startup",
-    selected = preferences.startupChecks ~= false,
-  }
-  dialog:label {
-    text = "Checks linked sources and manager releases at most once every 24 hours.",
-    hexpand = true,
-  }
-  dialog:separator { text = "Local Data" }
-  dialog:label {
-    text = self.app.fs.joinPath(self.app.fs.userConfigPath, "extension-manager"),
-    hexpand = true,
-  }
-  dialog:button {
-    text = "Clear Cache…",
-    onclick = function()
-      if self:confirm(
-        "Clear Download Cache",
-        "Remove cached package artifacts that are not needed for the current restore point?",
-        "Clear Cache"
-      ) then
-        dialog:close()
-        self.controller:clear_cache()
-      end
-    end,
-  }
-  dialog:newrow()
-  dialog:button {
-    id = "save_preferences",
-    text = "Save",
-    focus = true,
-  }
-  dialog:button {
-    id = "cancel_preferences",
-    text = "Discard",
-  }
-  show_responsive(dialog)
-  if dialog.data.save_preferences then
-    preferences.startupChecks = dialog.data.startup_checks == true
+  local dialog = self.dialog
+  if not dialog then
+    return false
   end
+  dialog:modify {
+    id = "startup_checks",
+    selected = self.environment.plugin.preferences.startupChecks ~= false,
+  }
+  self.screen = "preferences"
+  self:refresh()
+  return true
 end
 
-function Ui:show_package_details(package, kind)
+function Ui:show_package_menu(package, kind)
+  if type(package) ~= "table" then
+    return false
+  end
   local manager_package = kind == "installed"
       and Model.is_manager_installed_package(package)
     or Model.is_manager_catalog_package(package)
-  local dialog = self.environment.Dialog {
-    title = package_title(package),
+  local menu = self.environment.Dialog {
     parent = self:_parent(),
-    resizeable = true,
   }
-  dialog:label {
-    label = "Package:",
-    text = text(package.name, text(package.manifestName, package.id)),
-    hexpand = true,
-  }
-  dialog:label {
-    label = "Version:",
-    text = package_version(package),
-  }
+  add_package_menu_info(
+    menu,
+    "package_summary",
+    nil,
+    package_title(package) .. " · v" .. package_version(package)
+  )
+  add_package_menu_info(
+    menu,
+    "package_identity",
+    "Package",
+    text(package.name, text(package.manifestName, package.id))
+  )
   if package.author then
-    dialog:label {
-      label = "Author:",
-      text = author_name(package.author),
-    }
+    add_package_menu_info(menu, "package_author", "Author", author_name(package.author))
   end
   if package.license then
-    dialog:label {
-      label = "License:",
-      text = text(package.license),
-    }
+    add_package_menu_info(menu, "package_license", "License", text(package.license))
   end
 
   if kind == "installed" then
-    dialog:label {
-      label = "Source:",
-      text = source_label(package.source),
-      hexpand = true,
-    }
-    dialog:label {
-      label = "Managed:",
-      text = package.managed and "Yes" or "No",
-    }
+    add_package_menu_info(menu, "package_source", "Source", source_label(package.source))
+    add_package_menu_info(
+      menu,
+      "package_managed",
+      "Status",
+      package.managed and "✓ Managed" or "⚠ Unmanaged"
+    )
     if package.enabled ~= nil then
-      dialog:label {
-        label = "Enabled:",
-        text = package.enabled and "Yes" or "No",
-      }
+      add_package_menu_info(
+        menu,
+        "package_enabled",
+        "State",
+        package.enabled and "Enabled" or "Disabled"
+      )
     end
     if package.update then
       local update_version = type(package.update) == "table" and package.update.version
         or package.update
-      dialog:label {
-        label = "Update:",
-        text = text(update_version, "Available"),
-      }
+      add_package_menu_info(
+        menu,
+        "package_update",
+        "Update",
+        text(update_version, "Available")
+      )
     end
     if package.updateError then
-      dialog:label {
-        label = "Update check:",
-        text = Protocol.error_message(package.updateError),
-        hexpand = true,
-      }
+      add_package_menu_info(
+        menu,
+        "package_update_error",
+        "Update check",
+        Protocol.error_message(package.updateError)
+      )
       local recovery = recovery_artifact(package)
       if type(recovery) == "string" and recovery ~= "" then
-        dialog:label {
-          label = "Recovery package:",
-          text = recovery,
-          hexpand = true,
-        }
+        add_package_menu_info(menu, "package_recovery", "Recovery package", recovery)
       end
     end
-    dialog:separator {}
     local manager_update = self_update_available(package)
     if package.update and (package.managed or manager_update) then
-      dialog:button {
+      menu:menuItem {
+        id = "package_update_action",
         text = manager_update and "Update Manager…" or "Update",
         onclick = function()
-          dialog:close()
           self.controller:update_package(package)
         end,
       }
     end
     if package.rollbackAvailable then
-      dialog:button {
+      menu:menuItem {
+        id = "package_restore",
         text = manager_package and "Restore Manager…" or "Restore…",
         onclick = function()
-          dialog:close()
           self.controller:restore_package(package)
         end,
       }
     end
     if not manager_package then
-      dialog:button {
+      menu:menuItem {
+        id = "package_enable_disable",
         text = "Enable / Disable…",
         onclick = function()
-          dialog:close()
           self.controller:open_native_extension_preferences("enable_disable", package)
         end,
       }
-      dialog:button {
-        text = "Uninstall…",
+      menu:menuItem {
+        id = "package_uninstall",
+        text = "Uninstall",
         onclick = function()
-          if self.controller:uninstall_package(package) then
-            dialog:close()
-          end
+          self.controller:uninstall_package(package)
         end,
       }
     end
   else
-    dialog:label {
-      label = "Repository:",
-      text = text(package.repository),
-      hexpand = true,
-    }
+    add_package_menu_info(menu, "package_repository", "Repository", text(package.repository))
     if manager_package then
-      dialog:label {
-        text = "Manager updates are available from Help.",
-      }
+      add_package_menu_info(
+        menu,
+        "package_availability",
+        nil,
+        "Manager updates are available from Help."
+      )
     elseif not package.latest then
-      dialog:label {
-        text = "No compatible stable release is available for this Aseprite version.",
-      }
+      add_package_menu_info(
+        menu,
+        "package_availability",
+        nil,
+        "No compatible stable release is available for this Aseprite version."
+      )
     elseif self.model.registryExpired then
-      dialog:label {
-        text = "Catalog metadata is expired. This package is view-only.",
-      }
+      add_package_menu_info(
+        menu,
+        "package_availability",
+        nil,
+        "Catalog metadata is expired. This package is view-only."
+      )
     else
-      dialog:separator {}
-      dialog:button {
+      menu:menuItem {
+        id = "package_install",
         text = "Install",
         onclick = function()
-          dialog:close()
           self.controller:install_registry_package(package)
         end,
       }
     end
   end
-  dialog:button {
-    text = "Close",
-  }
-  show_responsive(dialog)
+  menu:showMenu()
+  return true
 end
 
 return Ui

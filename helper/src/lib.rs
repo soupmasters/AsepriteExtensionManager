@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 pub mod github;
+pub mod installation;
 pub mod installed;
 pub mod package;
 pub mod protocol;

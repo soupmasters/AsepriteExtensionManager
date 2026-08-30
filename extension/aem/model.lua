@@ -164,17 +164,27 @@ function Model.new(page_size)
   return setmetatable({
     catalog = {},
     installed = {},
+    githubRepositories = {},
     updateErrors = {},
     managerCatalogPackage = nil,
     managerPackage = nil,
     browseSearch = "",
     installedSearch = "",
+    githubSearch = "",
     browseSort = "name_asc",
     installedSort = "name_asc",
     browseFilter = "all",
     installedFilter = "all",
     browsePage = 1,
     installedPage = 1,
+    githubPage = 1,
+    githubPageCount = 1,
+    githubTotal = 0,
+    githubHasNextPage = false,
+    githubEndCursor = nil,
+    githubLoading = false,
+    githubLoaded = false,
+    githubError = nil,
     pageSize = page_size or 6,
     registryStatus = "bundled",
     registryExpired = false,
@@ -203,6 +213,30 @@ function Model:set_installed(packages)
   self.installedPage = 1
 end
 
+function Model:set_github_page(packages, page, total, has_next_page, end_cursor)
+  self.githubRepositories = packages or {}
+  self.githubTotal = math.max(0, tonumber(total) or #self.githubRepositories)
+  self.githubPageCount = math.max(1, math.ceil(self.githubTotal / self.pageSize))
+  self.githubPage = math.max(1, math.min(tonumber(page) or 1, self.githubPageCount))
+  self.githubHasNextPage = has_next_page == true
+  self.githubEndCursor = type(end_cursor) == "string" and end_cursor or nil
+  self.githubLoading = false
+  self.githubLoaded = true
+  self.githubError = nil
+end
+
+function Model:set_github_error(error_value)
+  self.githubRepositories = {}
+  self.githubPage = 1
+  self.githubPageCount = 1
+  self.githubTotal = 0
+  self.githubHasNextPage = false
+  self.githubEndCursor = nil
+  self.githubLoading = false
+  self.githubLoaded = true
+  self.githubError = error_value
+end
+
 function Model:set_update_errors(errors)
   local visible = {}
   for _, update_error in ipairs(errors or {}) do
@@ -219,10 +253,17 @@ function Model:set_search(kind, value)
   if kind == "browse" then
     self.browseSearch = value or ""
     self.browsePage = 1
-  else
+    return true
+  elseif kind == "installed" then
     self.installedSearch = value or ""
     self.installedPage = 1
+    return true
+  elseif kind == "github" then
+    self.githubSearch = value or ""
+    self.githubPage = 1
+    return true
   end
+  return false
 end
 
 function Model:set_sort(kind, value)
@@ -285,11 +326,13 @@ function Model:filtered(kind)
     query = folded(self.browseSearch)
     selected_filter = self.browseFilter
     selected_sort = self.browseSort
-  else
+  elseif kind == "installed" then
     list = self.installed
     query = folded(self.installedSearch)
     selected_filter = self.installedFilter
     selected_sort = self.installedSort
+  else
+    return {}
   end
 
   local result = {}
@@ -304,8 +347,21 @@ function Model:filtered(kind)
 end
 
 function Model:page(kind)
+  if kind == "github" then
+    return self.githubRepositories,
+      self.githubPage,
+      self.githubPageCount,
+      self.githubTotal
+  end
   local filtered = self:filtered(kind)
-  local field = kind == "browse" and "browsePage" or "installedPage"
+  local field
+  if kind == "browse" then
+    field = "browsePage"
+  elseif kind == "installed" then
+    field = "installedPage"
+  else
+    return {}, 1, 1, 0
+  end
   local page_count = math.max(1, math.ceil(#filtered / self.pageSize))
   self[field] = math.max(1, math.min(self[field], page_count))
 
@@ -319,9 +375,17 @@ function Model:page(kind)
 end
 
 function Model:move_page(kind, delta)
-  local field = kind == "browse" and "browsePage" or "installedPage"
+  local field
+  if kind == "browse" then
+    field = "browsePage"
+  elseif kind == "installed" then
+    field = "installedPage"
+  else
+    return false
+  end
   self[field] = self[field] + delta
   self:page(kind)
+  return true
 end
 
 return Model

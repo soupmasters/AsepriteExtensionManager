@@ -128,6 +128,71 @@ Test.case("closed controller ignores a pending diagnostics callback", function()
   Test.equal(callback_count, 0)
 end)
 
+Test.case("GitHub repository browsing uses bounded cursor requests", function()
+  local controller, _, _, _, rpc, ui = controller_fixture()
+  Test.truthy(controller:search_github_repositories(" animation "))
+  Test.equal(rpc.requests[1].method, "listGitHubRepositories")
+  Test.equal(rpc.requests[1].params.query, "animation")
+  Test.equal(rpc.requests[1].params.cursor, nil)
+  Test.truthy(controller.model.githubLoading)
+
+  rpc:respond(1, {
+    repositories = {
+      {
+        nameWithOwner = "example/animation-tools",
+        url = "https://github.com/example/animation-tools",
+        isPrivate = true,
+      },
+    },
+    totalCount = 8,
+    hasNextPage = true,
+    endCursor = "next==",
+  })
+  Test.falsy(controller.model.githubLoading)
+  Test.truthy(controller.model.githubLoaded)
+  Test.equal(controller.model.githubTotal, 8)
+  Test.equal(controller.model.githubPageCount, 2)
+  Test.equal(controller.model.githubRepositories[1].nameWithOwner, "example/animation-tools")
+
+  Test.truthy(controller:move_github_page(1))
+  Test.equal(rpc.requests[2].method, "listGitHubRepositories")
+  Test.equal(rpc.requests[2].params.query, "animation")
+  Test.equal(rpc.requests[2].params.cursor, "next==")
+  rpc:respond(2, {
+    repositories = {},
+    totalCount = 8,
+    hasNextPage = false,
+  })
+  Test.equal(controller.model.githubPage, 2)
+  Test.truthy(controller:move_github_page(-1))
+  Test.equal(rpc.requests[3].params.cursor, nil)
+
+  rpc:fail(3, {
+    code = "GITHUB_CLI_AUTH_REQUIRED",
+    message = "Run gh auth login",
+  })
+  Test.equal(controller.model.githubError.code, "GITHUB_CLI_AUTH_REQUIRED")
+  Test.truthy(ui.refreshCount >= 6)
+end)
+
+Test.case("GitHub repository install reuses the validated URL flow", function()
+  local controller, _, _, _, rpc, ui = controller_fixture()
+  local repository = {
+    nameWithOwner = "example/private-extension",
+    url = "https://github.com/example/private-extension",
+    isPrivate = true,
+  }
+  Test.truthy(controller:install_github_repository(repository))
+  Test.equal(rpc.requests[1].method, "resolveGitHub")
+  Test.equal(rpc.requests[1].params.url, repository.url)
+
+  local blocked, _, _, _, blocked_rpc, blocked_ui = controller_fixture()
+  Test.falsy(blocked:install_github_repository({}))
+  Test.equal(#blocked_rpc.requests, 0)
+  Test.equal(blocked_ui.errors[1].title, "GitHub Repository Unavailable")
+  Test.equal(#ui.errors, 0)
+end)
+
 Test.case("incompatible versions show a message before helper launch", function()
   local controller, _, _, _, rpc, ui = controller_fixture {
     apiVersion = 34,
@@ -625,8 +690,7 @@ end)
 Test.case("native extension preferences are followed by a rescan", function()
   local controller, _, calls, _, rpc = controller_fixture()
   Test.truthy(controller:open_native_extension_preferences())
-  Test.equal(#calls.alerts, 1)
-  Test.contains(calls.alerts[1].text, "Choose Extensions")
+  Test.equal(#calls.alerts, 0)
   Test.equal(#calls.options, 1)
   Test.equal(rpc.requests[1].method, "scanInstalled")
 end)
@@ -643,12 +707,8 @@ Test.case("failed native extension preferences do not report success", function(
   Test.equal(#rpc.requests, 0)
 end)
 
-Test.case("confirmed uninstall removes the exact scanned package through the helper", function()
-  local controller, _, calls, _, rpc, ui = controller_fixture {
-    confirms = {
-      true,
-    },
-  }
+Test.case("uninstall immediately removes the exact scanned package through the helper", function()
+  local controller, _, calls, _, rpc, ui = controller_fixture()
   local package = {
     name = "animation-list",
     displayName = "Animation List",
@@ -659,12 +719,7 @@ Test.case("confirmed uninstall removes the exact scanned package through the hel
   controller.model:set_installed({ package })
 
   Test.truthy(controller:uninstall_package(package))
-  Test.equal(#ui.confirmations, 1)
-  Test.equal(ui.confirmations[1].title, "Uninstall Extension")
-  Test.contains(ui.confirmations[1].message, "Restart Aseprite immediately")
-  Test.contains(ui.confirmations[1].message, "Animation List?\n\nIts files")
-  Test.contains(ui.confirmations[1].message, "recovery copy.\nRestart Aseprite")
-  Test.contains(ui.confirmations[1].message, "afterward.\nUntil then")
+  Test.equal(#ui.confirmations, 0)
   Test.equal(#ui.progressDialogs, 0)
   Test.equal(rpc.requests[1].method, "uninstallPackage")
   Test.equal(rpc.requests[1].params.name, "animation-list")
@@ -716,17 +771,13 @@ Test.case("confirmed uninstall removes the exact scanned package through the hel
     name = "another",
   }))
   Test.equal(#rpc.requests, 1)
-  Test.equal(#ui.confirmations, 1)
+  Test.equal(#ui.confirmations, 0)
   Test.equal(#calls.options, 0)
   Test.contains(calls.tips[#calls.tips].message, "Restart Aseprite")
 end)
 
 Test.case("busy refresh prevents uninstall from racing a stale scan", function()
-  local controller, _, _, _, rpc, ui = controller_fixture {
-    confirms = {
-      true,
-    },
-  }
+  local controller, _, _, _, rpc, ui = controller_fixture()
   Test.truthy(controller:refresh(false))
   Test.truthy(controller.model.busy)
 
@@ -742,11 +793,7 @@ Test.case("busy refresh prevents uninstall from racing a stale scan", function()
 end)
 
 Test.case("closing during uninstall preserves the restart lock", function()
-  local controller, _, calls, _, rpc = controller_fixture {
-    confirms = {
-      true,
-    },
-  }
+  local controller, _, calls, _, rpc = controller_fixture()
   Test.truthy(controller:uninstall_package {
     name = "example",
     version = "1.0.0",
@@ -767,11 +814,7 @@ Test.case("closing during uninstall preserves the restart lock", function()
 end)
 
 Test.case("definite helper rejection clears the provisional restart lock", function()
-  local controller, _, _, _, rpc, ui = controller_fixture {
-    confirms = {
-      true,
-    },
-  }
+  local controller, _, _, _, rpc, ui = controller_fixture()
   Test.truthy(controller:uninstall_package {
     name = "example",
     version = "1.0.0",
@@ -789,11 +832,7 @@ Test.case("definite helper rejection clears the provisional restart lock", funct
 end)
 
 Test.case("uncertain uninstall failure keeps the restart lock", function()
-  local controller, _, _, _, rpc, ui = controller_fixture {
-    confirms = {
-      true,
-    },
-  }
+  local controller, _, _, _, rpc, ui = controller_fixture()
   Test.truthy(controller:uninstall_package {
     name = "example",
     version = "1.0.0",
@@ -810,27 +849,15 @@ Test.case("uncertain uninstall failure keeps the restart lock", function()
   Test.equal(#ui.errors, 1)
 end)
 
-Test.case("declined and manager uninstalls never reach the helper", function()
-  local controller, _, _, _, rpc, ui = controller_fixture {
-    confirms = {
-      false,
-    },
-  }
-  Test.falsy(controller:uninstall_package {
-    name = "example",
-    version = "1.0.0",
-    path = "/profile/extensions/example",
-  })
-  Test.equal(#ui.confirmations, 1)
-  Test.equal(#rpc.requests, 0)
-
+Test.case("manager uninstalls never reach the helper", function()
+  local controller, _, _, _, rpc, ui = controller_fixture()
   Test.falsy(controller:uninstall_package {
     name = "aseprite-extension-manager",
     version = "0.1.0",
     path = "/profile/extensions/aseprite-extension-manager",
     isSelf = true,
   })
-  Test.equal(#ui.confirmations, 1)
+  Test.equal(#ui.confirmations, 0)
   Test.equal(#rpc.requests, 0)
 end)
 

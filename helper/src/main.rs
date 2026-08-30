@@ -183,8 +183,9 @@ fn parse_options(arguments: Vec<String>) -> Result<CliOptions, aem_helper::proto
 }
 
 async fn launch(options: CliOptions) -> Result<(), aem_helper::protocol::RpcError> {
-    let state = State::new(&options.user_config)?;
+    let (state, state_lock) = State::new_locked(&options.user_config)?;
     let log = state.open_rotated_log()?;
+    drop(state_lock);
     let executable = std::env::current_exe().map_err(aem_helper::protocol::RpcError::io)?;
     let mut command = Command::new(executable);
     command

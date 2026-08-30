@@ -51,7 +51,8 @@ profile for destructive failure simulations.
    no blanket permission is requested.
 3. Confirm the resizable nonmodal dialog uses native widgets, Browse shows the
    curated catalog, and Installed shows unmanaged extensions without modifying
-   them.
+   them. Confirm GitHub is hidden when either Git or GitHub CLI is missing, and
+   otherwise lists searchable, paged repositories for the signed-in account.
 4. Install one curated release asset and one curated repository snapshot.
    Confirm both exact source hashes are authenticated, the snapshot records its
    immutable commit, and each installed receipt records the correct source.

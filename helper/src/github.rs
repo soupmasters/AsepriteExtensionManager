@@ -31,8 +31,8 @@ const GH_JSON_TIMEOUT: Duration = Duration::from_secs(30);
 const GH_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(120);
 const GH_REPOSITORY_JSON_BYTES: u64 = 8 * 1024 * 1024;
 const GH_REPOSITORY_PAGE_SIZE: usize = 6;
-const GH_REPOSITORY_SCAN_PAGE_SIZE: u32 = 50;
-const GH_REPOSITORY_SCAN_LIMIT: usize = 500;
+const GH_REPOSITORY_SCAN_PAGE_SIZE: u32 = 100;
+const GH_REPOSITORY_SCAN_LIMIT: usize = 100;
 const GH_REPOSITORY_SCAN_TIMEOUT: Duration = Duration::from_secs(60);
 const GH_REPOSITORY_MANIFEST_BYTES: u64 = 64 * 1024;
 const GH_REPOSITORY_MANIFEST_BATCH_SIZE: usize = 16;
@@ -2842,7 +2842,7 @@ printf '%s' '{"ok":true}'
                 "-f",
                 &format!("query={GH_REPOSITORY_QUERY}"),
                 "-F",
-                "first=50",
+                "first=100",
             ]
             .into_iter()
             .map(OsString::from)
@@ -3061,6 +3061,103 @@ printf '%s' '{"data":{"viewer":{"repositories":{"totalCount":2,"pageInfo":{"hasN
         assert_eq!(page.total_count, 1);
         assert!(!page.has_next_page);
         assert!(page.end_cursor.is_none());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn repository_browser_resumes_after_a_bounded_empty_scan() {
+        let unrelated_edges = (1..=GH_REPOSITORY_SCAN_LIMIT)
+            .map(|index| {
+                serde_json::json!({
+                    "cursor": format!("cursor-{index}=="),
+                    "node": {
+                        "name": format!("unrelated-{index}"),
+                        "owner": {"login": "example"},
+                        "description": null,
+                        "isPrivate": false,
+                        "isArchived": false,
+                        "isFork": false,
+                        "updatedAt": null,
+                        "viewerPermission": "READ",
+                        "manifest": null,
+                        "latestRelease": null
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        let first_response = serde_json::json!({
+            "data": {
+                "viewer": {
+                    "repositories": {
+                        "totalCount": GH_REPOSITORY_SCAN_LIMIT + 1,
+                        "pageInfo": {
+                            "hasNextPage": true,
+                            "endCursor": format!("cursor-{}==", GH_REPOSITORY_SCAN_LIMIT)
+                        },
+                        "edges": unrelated_edges
+                    }
+                }
+            }
+        })
+        .to_string();
+        let second_response = serde_json::json!({
+            "data": {
+                "viewer": {
+                    "repositories": {
+                        "totalCount": GH_REPOSITORY_SCAN_LIMIT + 1,
+                        "pageInfo": {"hasNextPage": false, "endCursor": null},
+                        "edges": [{
+                            "cursor": "aseprite-cursor==",
+                            "node": {
+                                "name": "real-extension",
+                                "owner": {"login": "example"},
+                                "description": null,
+                                "isPrivate": false,
+                                "isArchived": false,
+                                "isFork": false,
+                                "updatedAt": null,
+                                "viewerPermission": "READ",
+                                "manifest": null,
+                                "latestRelease": {
+                                    "isDraft": false,
+                                    "isPrerelease": false,
+                                    "releaseAssets": {
+                                        "nodes": [{"name": "real.aseprite-extension"}]
+                                    }
+                                }
+                            }
+                        }]
+                    }
+                }
+            }
+        })
+        .to_string();
+        let last_cursor = format!("cursor-{}==", GH_REPOSITORY_SCAN_LIMIT);
+        let script = format!(
+            "#!/bin/sh\nfor argument in \"$@\"; do\n  if [ \"$argument\" = \"after={last_cursor}\" ]; then\n    printf '%s' '{second_response}'\n    exit 0\n  fi\ndone\nprintf '%s' '{first_response}'\n"
+        );
+        let (directory, executable) = fake_gh(&script);
+
+        let first = list_repositories_with_executable(&executable, None, None)
+            .await
+            .unwrap();
+        assert!(first.repositories.is_empty());
+        assert_eq!(first.total_count, 1);
+        assert!(first.has_next_page);
+        assert_eq!(first.end_cursor.as_deref(), Some(last_cursor.as_str()));
+
+        let second =
+            list_repositories_with_executable(&executable, None, first.end_cursor.as_deref())
+                .await
+                .unwrap();
+        drop(directory);
+        assert_eq!(second.repositories.len(), 1);
+        assert_eq!(
+            second.repositories[0].name_with_owner,
+            "example/real-extension"
+        );
+        assert!(!second.has_next_page);
+        assert!(second.end_cursor.is_none());
     }
 
     #[cfg(unix)]

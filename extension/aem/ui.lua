@@ -263,7 +263,9 @@ end
 
 local function show_responsive(dialog, options)
   options = options or {}
-  options.autoscrollbars = true
+  if options.autoscrollbars == nil then
+    options.autoscrollbars = true
+  end
   return dialog:show(options)
 end
 
@@ -338,6 +340,54 @@ local function add_package_menu_info(menu, id, label, value)
     text = package_menu_line(label, value),
     enabled = false,
   }
+end
+
+local function repository_url(value)
+  if type(value) == "table" then
+    value = value.url
+  end
+  if type(value) ~= "string" then
+    return nil
+  end
+  value = value:match("^%s*(.-)%s*$")
+  if value == ""
+    or value:find("[%c%s]")
+    or not value:match("^https://[^/]+")
+  then
+    return nil
+  end
+  return value
+end
+
+local function package_repository_url(package)
+  if type(package) ~= "table" then
+    return nil
+  end
+  local direct = repository_url(package.repository)
+  if direct then
+    return direct
+  end
+  if type(package.source) == "table" then
+    return repository_url(package.source.repository)
+  end
+  return nil
+end
+
+local function add_repository_menu_action(ui, menu, id, value)
+  local url = repository_url(value)
+  if not url then
+    return false
+  end
+  menu:menuItem {
+    id = id,
+    text = "Visit Repository",
+    onclick = function()
+      ui.app.command.Launch {
+        path = url,
+      }
+    end,
+  }
+  return true
 end
 
 local function wrapped_text_lines(value, columns)
@@ -977,6 +1027,15 @@ function Ui:_activate_tab(tab)
   if not kind or self.activeView == kind then
     return
   end
+
+  local previous_autofit
+  local autofit_suspended = false
+  if self.responsiveReady and self.dialog then
+    autofit_suspended = pcall(function()
+      previous_autofit = self.dialog.autofit
+      self.dialog.autofit = 0
+    end)
+  end
   self.activeView = kind
   if kind == "github"
     and self.githubAuthenticated
@@ -989,6 +1048,15 @@ function Ui:_activate_tab(tab)
   end
   if self.responsiveReady then
     self:refresh()
+  end
+  if autofit_suspended and self.dialog then
+    pcall(function()
+      self.dialog.autofit = previous_autofit
+      self.dialog:modify {
+        id = "manager_tabs",
+        visible = self.screen == "manager",
+      }
+    end)
   end
 end
 
@@ -1254,7 +1322,7 @@ function Ui:_build()
     dialog:button {
       id = "browse_details_" .. tostring(index),
       label = not self.supportsSameRow and "" or nil,
-      text = "Details ▾",
+      text = "Edit ▾",
       visible = false,
       hexpand = false,
       onclick = function()
@@ -1277,7 +1345,7 @@ function Ui:_build()
     if self.supportsSameRow then
       dialog:button {
         id = "browse_stacked_details_" .. tostring(index),
-        text = "Details ▾",
+        text = "Edit ▾",
         visible = false,
         hexpand = false,
         onclick = function()
@@ -1291,72 +1359,6 @@ function Ui:_build()
     end
   end
   add_pager(self, dialog, "browse", self.supportsSameRow)
-
-  dialog:tab {
-    id = "installed_tab",
-    text = "Installed",
-  }
-  add_search_control(self, dialog, "installed", self.supportsSameRow)
-  add_view_controls(self, dialog, "installed", self.supportsSameRow)
-  dialog:label {
-    id = "installed_empty",
-    text = "No user extensions were found.",
-    hexpand = true,
-  }
-  if self.supportsSameRow then
-    dialog:newrow()
-  end
-  for index = 1, self.model.pageSize do
-    local row_index = index
-    if self.supportsSameRow then
-      dialog:label {
-        id = "installed_row_lead_" .. tostring(index),
-        text = "",
-        visible = false,
-        hexpand = false,
-      }
-      dialog:samerow()
-    end
-    dialog:button {
-      id = "installed_details_" .. tostring(index),
-      label = not self.supportsSameRow and "" or nil,
-      text = "Details ▾",
-      visible = false,
-      hexpand = false,
-      onclick = function()
-        local package = self.installedRows[row_index]
-        if package then
-          self:show_package_menu(package, "installed")
-        end
-      end,
-    }
-    if self.supportsSameRow then
-      dialog:samerow()
-      dialog:label {
-        id = "installed_row_" .. tostring(index),
-        text = "",
-        visible = false,
-        hexpand = false,
-      }
-    end
-    dialog:newrow()
-    if self.supportsSameRow then
-      dialog:button {
-        id = "installed_stacked_details_" .. tostring(index),
-        text = "Details ▾",
-        visible = false,
-        hexpand = false,
-        onclick = function()
-          local package = self.installedRows[row_index]
-          if package then
-            self:show_package_menu(package, "installed")
-          end
-        end,
-      }
-      dialog:newrow()
-    end
-  end
-  add_pager(self, dialog, "installed", self.supportsSameRow)
 
   dialog:tab {
     id = "github_tab",
@@ -1427,6 +1429,72 @@ function Ui:_build()
     end
   end
   add_pager(self, dialog, "github", self.supportsSameRow)
+
+  dialog:tab {
+    id = "installed_tab",
+    text = "Installed",
+  }
+  add_search_control(self, dialog, "installed", self.supportsSameRow)
+  add_view_controls(self, dialog, "installed", self.supportsSameRow)
+  dialog:label {
+    id = "installed_empty",
+    text = "No user extensions were found.",
+    hexpand = true,
+  }
+  if self.supportsSameRow then
+    dialog:newrow()
+  end
+  for index = 1, self.model.pageSize do
+    local row_index = index
+    if self.supportsSameRow then
+      dialog:label {
+        id = "installed_row_lead_" .. tostring(index),
+        text = "",
+        visible = false,
+        hexpand = false,
+      }
+      dialog:samerow()
+    end
+    dialog:button {
+      id = "installed_details_" .. tostring(index),
+      label = not self.supportsSameRow and "" or nil,
+      text = "Edit ▾",
+      visible = false,
+      hexpand = false,
+      onclick = function()
+        local package = self.installedRows[row_index]
+        if package then
+          self:show_package_menu(package, "installed")
+        end
+      end,
+    }
+    if self.supportsSameRow then
+      dialog:samerow()
+      dialog:label {
+        id = "installed_row_" .. tostring(index),
+        text = "",
+        visible = false,
+        hexpand = false,
+      }
+    end
+    dialog:newrow()
+    if self.supportsSameRow then
+      dialog:button {
+        id = "installed_stacked_details_" .. tostring(index),
+        text = "Edit ▾",
+        visible = false,
+        hexpand = false,
+        onclick = function()
+          local package = self.installedRows[row_index]
+          if package then
+            self:show_package_menu(package, "installed")
+          end
+        end,
+      }
+      dialog:newrow()
+    end
+  end
+  add_pager(self, dialog, "installed", self.supportsSameRow)
   dialog:endtabs {
     id = "manager_tabs",
     selected = "browse_tab",
@@ -1608,6 +1676,7 @@ function Ui:open(controller)
   self:refresh()
   show_responsive(self.dialog, {
     wait = false,
+    autoscrollbars = false,
   })
   local bounds = manager_show_bounds(
     self.dialog,
@@ -1736,18 +1805,23 @@ function Ui:refresh()
     visible = self.githubAvailable,
     enabled = self.githubAvailable,
   }
-  local github, github_page, github_pages, github_count = self.model:page("github")
+  local github, github_page, github_pages = self.model:page("github")
   self.githubRows = github
   local github_empty_message = ""
   if not self.githubAuthenticated then
     github_empty_message = "Sign in with gh auth login to browse accessible repositories."
   elseif self.model.githubLoading then
-    github_empty_message = "Looking for Aseprite extension repositories..."
+    github_empty_message = "Checking repositories for Aseprite extensions..."
   elseif self.model.githubError then
     github_empty_message = Protocol.error_message(self.model.githubError)
-  elseif self.model.githubLoaded and github_count == 0 and self.model.githubSearch ~= "" then
+  elseif self.model.githubLoaded
+    and #github == 0
+    and self.model.githubHasNextPage
+  then
+    github_empty_message = "No Aseprite extensions on this page. Try the next page."
+  elseif self.model.githubLoaded and #github == 0 and self.model.githubSearch ~= "" then
     github_empty_message = "No Aseprite extension repositories match this search."
-  elseif self.model.githubLoaded and github_count == 0 then
+  elseif self.model.githubLoaded and #github == 0 then
     github_empty_message = "No Aseprite extension repositories were found."
   end
   dialog:modify {
@@ -2286,7 +2360,14 @@ function Ui:show_github_repository_menu(repository)
       repository.viewerPermission
     )
   end
-  add_package_menu_info(menu, "github_repository_url", "Repository", text(repository.url))
+  if not add_repository_menu_action(
+    self,
+    menu,
+    "github_repository_url",
+    repository.url
+  ) then
+    add_package_menu_info(menu, "github_repository_url", "Repository", text(repository.url))
+  end
   menu:menuItem {
     id = "github_repository_install",
     text = "Install",
@@ -2329,6 +2410,12 @@ function Ui:show_package_menu(package, kind)
 
   if kind == "installed" then
     add_package_menu_info(menu, "package_source", "Source", source_label(package.source))
+    add_repository_menu_action(
+      self,
+      menu,
+      "package_repository",
+      package_repository_url(package)
+    )
     add_package_menu_info(
       menu,
       "package_managed",
@@ -2401,7 +2488,19 @@ function Ui:show_package_menu(package, kind)
       }
     end
   else
-    add_package_menu_info(menu, "package_repository", "Repository", text(package.repository))
+    if not add_repository_menu_action(
+      self,
+      menu,
+      "package_repository",
+      package_repository_url(package)
+    ) then
+      add_package_menu_info(
+        menu,
+        "package_repository",
+        "Repository",
+        text(package.repository)
+      )
+    end
     if manager_package then
       add_package_menu_info(
         menu,

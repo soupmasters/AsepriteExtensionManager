@@ -73,6 +73,12 @@ local function manager_update_result(version)
   }
 end
 
+Test.case("controller keeps the Browse pager above its spare row", function()
+  local controller = controller_fixture()
+  Test.equal(controller.model.pageSize, 6)
+  Test.equal(controller.model.browsePageSize, 5)
+end)
+
 Test.case("batch mode performs no UI or helper work", function()
   local controller, _, _, _, rpc, ui = controller_fixture {
     isUIAvailable = false,

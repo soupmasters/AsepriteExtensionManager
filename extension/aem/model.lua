@@ -160,7 +160,7 @@ local function sort_packages(kind, selected, packages)
   end)
 end
 
-function Model.new(page_size)
+function Model.new(page_size, browse_page_size)
   return setmetatable({
     catalog = {},
     installed = {},
@@ -186,6 +186,7 @@ function Model.new(page_size)
     githubLoaded = false,
     githubError = nil,
     pageSize = page_size or 6,
+    browsePageSize = browse_page_size or page_size or 6,
     registryStatus = "bundled",
     registryExpired = false,
     registryFromCache = false,
@@ -359,19 +360,21 @@ function Model:page(kind)
   end
   local filtered = self:filtered(kind)
   local field
+  local page_size = self.pageSize
   if kind == "browse" then
     field = "browsePage"
+    page_size = self.browsePageSize
   elseif kind == "installed" then
     field = "installedPage"
   else
     return {}, 1, 1, 0
   end
-  local page_count = math.max(1, math.ceil(#filtered / self.pageSize))
+  local page_count = math.max(1, math.ceil(#filtered / page_size))
   self[field] = math.max(1, math.min(self[field], page_count))
 
-  local first = (self[field] - 1) * self.pageSize + 1
+  local first = (self[field] - 1) * page_size + 1
   local page = {}
-  for index = first, math.min(first + self.pageSize - 1, #filtered) do
+  for index = first, math.min(first + page_size - 1, #filtered) do
     page[#page + 1] = filtered[index]
   end
 

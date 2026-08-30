@@ -38,14 +38,14 @@ downloads.
 
 The GitHub tab is shown only when both Git and GitHub CLI are installed.
 Repository discovery uses fixed, cursor-paged GraphQL queries with bounded
-output. Search text, cursors, and immutable Blob IDs are passed as individual
-process arguments, not through a shell. The helper filters discovery results
-to repositories with an Aseprite-shaped root manifest or a stable
-`.aseprite-extension` release asset. Root manifests are read in bounded
-batches and are never returned to Lua, logged, or cached. These signals are
-discovery hints only; full archive validation remains mandatory before
-installation. Private repository metadata is displayed only in the local
-manager window and is never cached or logged.
+output and checks at most 100 raw repositories per response. Search text,
+cursors, and immutable Blob IDs are passed as individual process arguments,
+not through a shell. The helper filters discovery results to repositories with
+an Aseprite-shaped root manifest or a stable `.aseprite-extension` release
+asset. Root manifests are read in bounded batches and are never returned to
+Lua, logged, or cached. These signals are discovery hints only; full archive
+validation remains mandatory before installation. Private repository metadata
+is displayed only in the local manager window and is never cached or logged.
 
 Release resolution prefers one stable `.aseprite-extension` asset. Multiple
 matching assets require explicit selection. Repository branches and tags are

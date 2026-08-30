@@ -86,7 +86,7 @@ function Controller.new(environment)
     environment = environment,
     app = environment.app,
     plugin = environment.plugin,
-    model = Model.new(6),
+    model = Model.new(6, 5),
     rpc = environment.rpc,
     startupTimer = nil,
     startupOfferTimer = nil,

@@ -127,11 +127,14 @@ bytes can be an update even when the manifest version is the same.
 
 `listGitHubRepositories` accepts only a bounded search string and an opaque,
 bounded page cursor. The helper runs fixed GraphQL queries through `gh api`,
-scans past unrelated repositories, and returns only repositories with a valid
-Aseprite-shaped root manifest or a stable `.aseprite-extension` release asset.
+checks at most 100 raw repositories per response, and returns only repositories
+with a valid Aseprite-shaped root manifest or a stable
+`.aseprite-extension` release asset. If more raw repositories remain, the
+response cursor resumes immediately after the last repository checked.
 Manifest blobs are read by immutable GitHub node ID, kept in memory only, and
-bounded before parsing. Page cursors refer to displayed matches so filtering
-does not skip or duplicate an extension. No caller-provided command,
+bounded before parsing. A cursor after six displayed matches resumes at the
+sixth match; a scan-budget cursor resumes after the last checked repository.
+Neither form skips or duplicates an extension. No caller-provided command,
 executable, host, or GraphQL document is accepted.
 
 `diagnostics` includes structured Git and GitHub CLI status used by Help. A

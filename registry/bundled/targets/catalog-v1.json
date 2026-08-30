@@ -36,15 +36,15 @@
     {
       "id": "unity-animation-event",
       "manifestName": "unity-animation-event",
-      "displayName": "Unity Event for Aseprite",
+      "displayName": "Unity Importer Plugin for Unity",
       "summary": "Author Unity animation events directly in Aseprite's timeline.",
       "author": {
         "name": "Martin Calander",
         "url": "https://github.com/martincalander"
       },
       "license": "MIT",
-      "homepage": "https://github.com/soupmasters/UnityEventForAseprite",
-      "repository": "https://github.com/soupmasters/UnityEventForAseprite",
+      "homepage": "https://github.com/soupmasters/UnityImporterPluginForUnity",
+      "repository": "https://github.com/soupmasters/UnityImporterPluginForUnity",
       "releases": [
         {
           "version": "1.3.2",
@@ -53,7 +53,7 @@
             "minimumApi": 35
           },
           "asset": {
-            "url": "https://github.com/soupmasters/UnityEventForAseprite/releases/download/v1.3.2/unity-animation-event-1.3.2.aseprite-extension",
+            "url": "https://github.com/soupmasters/UnityImporterPluginForUnity/releases/download/v1.3.2/unity-animation-event-1.3.2.aseprite-extension",
             "sha256": "9ded3e07adf55866264d32135b1ac6b38bc4ffa8422e042dc3131174b20f3754",
             "byteLength": 14336,
             "releaseTag": "v1.3.2",

@@ -1361,15 +1361,15 @@ mod tests {
             .with_timezone(&Utc);
         let verified = client.verify_repository(&repository, now).unwrap();
         assert_eq!(verified.versions.root, 1);
-        assert_eq!(verified.versions.timestamp, 4);
-        assert_eq!(verified.versions.snapshot, 4);
-        assert_eq!(verified.versions.targets, 4);
+        assert_eq!(verified.versions.timestamp, 5);
+        assert_eq!(verified.versions.snapshot, 5);
+        assert_eq!(verified.versions.targets, 5);
         assert_eq!(verified.catalog.packages.len(), 6);
         assert_eq!(verified.catalog.packages[0].id, "attachment-system");
         assert_eq!(verified.catalog.packages[1].id, "unity-animation-event");
         assert_eq!(
             verified.catalog.packages[1].display_name,
-            "Unity Event for Aseprite"
+            "Unity Importer Plugin for Unity"
         );
         assert_eq!(verified.catalog.packages[2].id, "mcskin-viewer");
         assert_eq!(verified.catalog.packages[3].id, "mask-like-extension");
@@ -1415,8 +1415,8 @@ mod tests {
             .expect("recovery validation permits an authenticated expired chain");
 
         fs::copy(
-            repository.join("metadata/4.snapshot.json"),
-            repository.join("metadata/04.snapshot.json"),
+            repository.join("metadata/5.snapshot.json"),
+            repository.join("metadata/05.snapshot.json"),
         )
         .unwrap();
         assert_eq!(
@@ -1426,7 +1426,7 @@ mod tests {
             "TUF_UNEXPECTED_FILE"
         );
 
-        fs::remove_file(repository.join("metadata/04.snapshot.json")).unwrap();
+        fs::remove_file(repository.join("metadata/05.snapshot.json")).unwrap();
         fs::write(repository.join("metadata/snapshot.json"), b"{}").unwrap();
         assert_eq!(
             validate_bundled_repository(&repository)

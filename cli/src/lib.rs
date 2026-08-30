@@ -859,16 +859,16 @@ mod tests {
         let package = CatalogPackage {
             id: "unity-animation-event".to_owned(),
             manifest_name: "unity-animation-event".to_owned(),
-            display_name: "Unity Event for Aseprite".to_owned(),
+            display_name: "Unity Importer Plugin for Unity".to_owned(),
             summary: String::new(),
             author: serde_json::json!({"name":"Martin Calander"}),
             license: "MIT".to_owned(),
             homepage: String::new(),
-            repository: "https://github.com/soupmasters/UnityEventForAseprite".to_owned(),
+            repository: "https://github.com/soupmasters/UnityImporterPluginForUnity".to_owned(),
             releases: Vec::new(),
         };
         let packages = [package];
-        let found = find_catalog_package(&packages, "unity-event-for-aseprite").unwrap();
+        let found = find_catalog_package(&packages, "unity-importer-plugin-for-unity").unwrap();
         assert_eq!(found.id, "unity-animation-event");
     }
 
@@ -876,9 +876,9 @@ mod tests {
     fn path_like_missing_sources_do_not_fall_through_to_the_catalog() {
         assert!(looks_like_path("./my-local-extension"));
         assert!(looks_like_path("thing.aseprite-extension"));
-        assert!(!looks_like_path("unity-event-for-aseprite"));
+        assert!(!looks_like_path("unity-importer-plugin-for-unity"));
         assert!(!looks_like_path(
-            "https://github.com/soupmasters/UnityEventForAseprite"
+            "https://github.com/soupmasters/UnityImporterPluginForUnity"
         ));
     }
 

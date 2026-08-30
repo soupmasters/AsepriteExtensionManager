@@ -14,7 +14,7 @@ The project is still in development.
 ```sh
 cargo install --locked --path cli
 aem search animation
-aem install unity-event-for-aseprite
+aem install unity-importer-plugin-for-unity
 ```
 
 `aem install` also accepts a GitHub URL or local extension folder. Aseprite

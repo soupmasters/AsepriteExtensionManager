@@ -51,7 +51,7 @@ aem doctor
 The main commands are:
 
 ```sh
-aem install unity-event-for-aseprite
+aem install unity-importer-plugin-for-unity
 aem install https://github.com/owner/repository
 aem install ./my-local-extension
 aem list

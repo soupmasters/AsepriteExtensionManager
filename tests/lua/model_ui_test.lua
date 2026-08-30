@@ -1734,13 +1734,13 @@ Test.case("catalog identities are searchable and manifest names appear in menus"
       latest = {
         version = "1.0.0",
       },
-      repository = "https://github.com/example/UnityEventForAseprite",
+      repository = "https://github.com/example/UnityImporterPluginForUnity",
     },
   }, "current", false, false)
   model:set_search("browse", "example-tools")
   local matches = model:filtered("browse")
   Test.equal(#matches, 1)
-  model:set_search("browse", "unityeventforaseprite")
+  model:set_search("browse", "unityimporterpluginforunity")
   matches = model:filtered("browse")
   Test.equal(#matches, 1)
 
@@ -1762,7 +1762,7 @@ Test.case("catalog identities are searchable and manifest names appear in menus"
   Test.equal(menu.widgetsById.package_identity.definition.text, "Package: Example-Tools")
   Test.contains(
     menu.widgetsById.package_repository.definition.text,
-    "UnityEventForAseprite"
+    "UnityImporterPluginForUnity"
   )
   Test.falsy(menu.widgetsById.package_identity.definition.enabled)
   Test.equal(menu.widgetsById.package_install.definition.text, "Install")

@@ -112,7 +112,7 @@ jobs:
             --keys registry/fixtures/keys \
             --catalog registry/catalog-v1.json \
             --root-version 1 \
-            --version 4 \
+            --version 5 \
             --output "$fixture_output"
           cmp registry/catalog-v1.json registry/bundled/targets/catalog-v1.json
           diff --recursive --unified registry/bundled "$fixture_output"

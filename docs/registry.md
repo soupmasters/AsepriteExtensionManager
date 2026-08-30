@@ -19,9 +19,9 @@ registry/
 ├── metadata/
 │   ├── 1.root.json
 │   ├── timestamp.json
-│   ├── 4.snapshot.json
+│   ├── 5.snapshot.json
 │   ├── snapshot.json
-│   ├── 4.targets.json
+│   ├── 5.targets.json
 │   └── targets.json
 └── targets/
     ├── <sha256>.catalog-v1.json
@@ -104,7 +104,7 @@ cargo run --locked -p xtask -- registry-fixtures \
   --keys registry/fixtures/keys \
   --catalog registry/catalog-v1.json \
   --root-version 1 \
-  --version 4 \
+  --version 5 \
   --output "$fixture_output"
 
 cargo run --locked -p xtask -- verify-registry-fixtures \
